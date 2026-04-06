@@ -868,7 +868,7 @@ fn spawn_models_cache_refresh() {
             .unwrap_or_else(|_| "https://models.dev/api.json".to_string());
         if let Ok(resp) = client
             .get(&url)
-            .header("User-Agent", "Claurst/0.0.7")
+            .header("User-Agent", "Claurst/0.0.8")
             .send()
             .await
         {

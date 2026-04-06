@@ -138,17 +138,17 @@ mod tests {
 
     #[test]
     fn newer_minor() {
-        assert!(is_newer("0.1.0", "0.0.7"));
+        assert!(is_newer("0.1.0", "0.0.8"));
     }
 
     #[test]
     fn same_version() {
-        assert!(!is_newer("0.0.7", "0.0.7"));
+        assert!(!is_newer("0.0.8", "0.0.8"));
     }
 
     #[test]
     fn older_version() {
-        assert!(!is_newer("0.0.5", "0.0.7"));
+        assert!(!is_newer("0.0.5", "0.0.8"));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
   <p>
     <a href="https://github.com/kuberwastaken/claurst"><img src="https://img.shields.io/badge/Built_with-Rust-CE4D2B?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust"></a>
-    <a href="https://github.com/kuberwastaken/claurst"><img src="https://img.shields.io/badge/Tracking-None-2E8B57?style=for-the-badge" alt="No Tracking"></a>
+    <a href="https://github.com/kuberwastaken/claurst"><img src="https://img.shields.io/badge/Version-0.0.8-2E8B57?style=for-the-badge" alt="Version 0.0.8"></a>
     <a href="https://github.com/kuberwastaken/claurst/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=for-the-badge" alt="GPL-3.0 License"></a>
   </p>
 
@@ -19,7 +19,9 @@
 ---
 
 > [!NOTE]
-> UPDATE: Multi Provider Support is OUT ! (Codex Auth in works) Run /connect to connect to your AI Provider of Choice! [EXPERIMENTAL]
+> UPDATE: Multi Provider Support is OUT ! Run /connect to connect to your AI Provider of Choice! [EXPERIMENTAL]
+>
+> Fun Additition: There's multiple speech types now ! Try out /Rocky and /Caveman to hear the difference! /Normal to go back to normal. [EXPERIMENTAL]
 >
 > **100% Coverage complete from original source** on the [`src-rust`](https://github.com/kuberwastaken/claurst/tree/main/src-rust) and it's already much more memory effecient than the original port, along with no tracking, experimental features unlocked and more. We're at a stage where I'm using Claurst to further build Claurst in <2 days and it's incredibly exciting.
 >

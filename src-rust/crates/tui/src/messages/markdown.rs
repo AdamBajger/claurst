@@ -9,6 +9,67 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+/// Render markdown for live streaming text.
+///
+/// Streaming deltas can arrive while markdown constructs are still incomplete
+/// (for example, an opening ``` fence with no closing fence yet). We append
+/// minimal synthetic closers so the parser produces stable line structure
+/// frame-to-frame.
+pub fn render_markdown_streaming(text: &str, width: u16) -> Vec<Line<'static>> {
+    let stabilized = stabilize_streaming_markdown(text);
+    render_markdown(&stabilized, width)
+}
+
+fn stabilize_streaming_markdown(text: &str) -> String {
+    let mut in_code_block = false;
+    let mut unmatched_bold = false;
+    let mut unmatched_tick = false;
+
+    for raw in text.lines() {
+        if raw.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+
+        if in_code_block {
+            continue;
+        }
+
+        let bytes = raw.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'`' {
+                unmatched_tick = !unmatched_tick;
+                i += 1;
+                continue;
+            }
+            if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'*' {
+                unmatched_bold = !unmatched_bold;
+                i += 2;
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    let mut out = text.to_string();
+
+    if unmatched_tick {
+        out.push('`');
+    }
+    if unmatched_bold {
+        out.push_str("**");
+    }
+    if in_code_block {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("```");
+    }
+
+    out
+}
+
 /// Regex pattern to detect URLs (http://, https://, ftp://, www.)
 static URL_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?:https?|ftp)://\S+|www\.\S+")
@@ -305,4 +366,25 @@ fn word_wrap(text: &str, width: usize) -> Vec<String> {
         result.push(text.to_string());
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stabilize_streaming_markdown;
+
+    #[test]
+    fn stabilize_adds_closers_for_unbalanced_tokens() {
+        let input = "hello **world\n```rust\nlet x = 1;";
+        let stabilized = stabilize_streaming_markdown(input);
+
+        assert!(stabilized.ends_with("\n```"));
+        assert!(stabilized.contains("**"));
+    }
+
+    #[test]
+    fn stabilize_keeps_balanced_markdown_unchanged() {
+        let input = "**ok**\n```rs\nlet x = 1;\n```";
+        let stabilized = stabilize_streaming_markdown(input);
+        assert_eq!(stabilized, input);
+    }
 }

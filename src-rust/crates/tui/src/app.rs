@@ -4959,7 +4959,7 @@ impl App {
             }
 
             QueryEvent::ToolEnd {
-                tool_name: _,
+                tool_name,
                 tool_id,
                 result,
                 is_error,
@@ -4984,10 +4984,23 @@ impl App {
                 }
                 self.invalidate_transcript();
                 if is_error {
-                    self.status_message = Some(format!("Tool error: {}", result));
-                } else {
-                    self.status_message = None;
+                    let mut summary = result
+                        .lines()
+                        .next()
+                        .unwrap_or("Tool execution failed")
+                        .trim()
+                        .to_string();
+                    if summary.chars().count() > 180 {
+                        summary = format!("{}...", summary.chars().take(177).collect::<String>());
+                    }
+                    self.status_message = Some(format!("Tool error ({}): {}", tool_name, summary));
+                    self.push_system_message(
+                        format!("Tool '{}' failed: {}", tool_name, summary),
+                        SystemMessageStyle::Warning,
+                    );
                 }
+                // Do NOT clear status_message on success - let it persist so user can see
+                // important messages like "Max turns reached" or other status notifications.
                 self.refresh_turn_diff_from_history();
             }
 

@@ -1088,6 +1088,12 @@ pub async fn run_query_loop(
                         Ok(s) => s,
                         Err(e) => {
                             error!(provider = %provider_id_str, error = %e, "Provider stream failed");
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.send(QueryEvent::Error(format!(
+                                    "Provider '{}' stream setup failed: {}",
+                                    provider_id_str, e
+                                )));
+                            }
                             return QueryOutcome::Error(
                                 claurst_core::error::ClaudeError::Api(e.to_string())
                             );
@@ -1108,6 +1114,8 @@ pub async fn run_query_loop(
                     let provider_stall = tokio::time::sleep(provider_stall_timeout);
                     tokio::pin!(provider_stall);
                     let mut provider_stream_stalled = false;
+                    let mut provider_stream_error: Option<String> = None;
+                    let mut provider_saw_message_stop = false;
 
                     loop {
                         tokio::select! {
@@ -1124,9 +1132,16 @@ pub async fn run_query_loop(
                                     None => break,
                                     Some(Err(e)) => {
                                         error!(provider = %provider_id_str, error = %e, "Provider stream error");
+                                        provider_stream_error = Some(e.to_string());
                                         break;
                                     }
                                     Some(Ok(evt)) => {
+                                        if let claurst_api::StreamEvent::Error { error_type, message } = &evt {
+                                            error!(provider = %provider_id_str, error_type = %error_type, message = %message, "Provider stream event error");
+                                            provider_stream_error = Some(format!("{}: {}", error_type, message));
+                                            break;
+                                        }
+
                                         // Forward to TUI via AnthropicStreamEvent mapping.
                                         if let Some(ref tx) = event_tx {
                                             if let Some(ae) = map_to_anthropic_event(&evt) {
@@ -1165,7 +1180,10 @@ pub async fn run_query_loop(
                                                     usage.output_tokens = u.output_tokens;
                                                 }
                                             }
-                                            claurst_api::StreamEvent::MessageStop => break,
+                                            claurst_api::StreamEvent::MessageStop => {
+                                                provider_saw_message_stop = true;
+                                                break;
+                                            }
                                             _ => {}
                                         }
                                     }
@@ -1186,6 +1204,39 @@ pub async fn run_query_loop(
                         }
                         turn -= 1;
                         continue;
+                    }
+
+                    if provider_stream_stalled {
+                        let msg = format!(
+                            "Provider '{}' stream stalled for 45s and retries were exhausted",
+                            provider_id_str
+                        );
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::Error(msg.clone()));
+                        }
+                        return QueryOutcome::Error(ClaudeError::Api(msg));
+                    }
+
+                    if let Some(err_msg) = provider_stream_error {
+                        let msg = format!(
+                            "Provider '{}' stream failed: {}",
+                            provider_id_str, err_msg
+                        );
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::Error(msg.clone()));
+                        }
+                        return QueryOutcome::Error(ClaudeError::Api(msg));
+                    }
+
+                    if !provider_saw_message_stop {
+                        let msg = format!(
+                            "Provider '{}' stream ended unexpectedly before message completion",
+                            provider_id_str
+                        );
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::Error(msg.clone()));
+                        }
+                        return QueryOutcome::Error(ClaudeError::Api(msg));
                     }
 
                     // Build the content blocks from accumulated stream data.
@@ -1305,6 +1356,12 @@ pub async fn run_query_loop(
                         model = %model_id_str,
                         "No credentials found for provider"
                     );
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Error(format!(
+                            "No API key for provider '{}' (model '{}'). {}",
+                            provider_id_str, model_id_str, hint
+                        )));
+                    }
                     return QueryOutcome::Error(
                         ClaudeError::Api(format!(
                             "No API key for provider '{}' (model '{}'). {}",
@@ -1347,6 +1404,9 @@ pub async fn run_query_loop(
                     }
                 }
                 error!(error = %e, "API request failed");
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(QueryEvent::Error(format!("API request failed: {}", e)));
+                }
                 return QueryOutcome::Error(e);
             }
         };
@@ -1358,6 +1418,8 @@ pub async fn run_query_loop(
         let mut accumulator = StreamAccumulator::new();
         let stall_deadline = tokio::time::sleep(STALL_TIMEOUT);
         tokio::pin!(stall_deadline);
+        let mut saw_message_stop = false;
+        let mut stream_error: Option<String> = None;
 
         let stream_stalled = loop {
             tokio::select! {
@@ -1380,8 +1442,13 @@ pub async fn run_query_loop(
                                         warn!(model = %effective_model, "API overloaded");
                                     }
                                     error!(error_type, message, "Stream error");
+                                    stream_error = Some(format!("{}: {}", error_type, message));
+                                    break false;
                                 }
-                                AnthropicStreamEvent::MessageStop => break false,
+                                AnthropicStreamEvent::MessageStop => {
+                                    saw_message_stop = true;
+                                    break false;
+                                }
                                 _ => {}
                             }
                         }
@@ -1402,6 +1469,29 @@ pub async fn run_query_loop(
             }
             turn -= 1; // don't count this stalled attempt
             continue;
+        }
+
+        if stream_stalled {
+            let msg = "Stream stalled for 45s and retries were exhausted".to_string();
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(QueryEvent::Error(msg.clone()));
+            }
+            return QueryOutcome::Error(ClaudeError::Api(msg));
+        }
+
+        if let Some(err_msg) = stream_error {
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(QueryEvent::Error(err_msg.clone()));
+            }
+            return QueryOutcome::Error(ClaudeError::Api(err_msg));
+        }
+
+        if !saw_message_stop {
+            let msg = "Stream ended unexpectedly before message completion".to_string();
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(QueryEvent::Error(msg.clone()));
+            }
+            return QueryOutcome::Error(ClaudeError::Api(msg));
         }
 
         let (assistant_msg, usage, stop_reason) = accumulator.finish();
@@ -1684,8 +1774,8 @@ pub async fn run_query_loop(
                         let dreamer = crate::auto_dream::AutoDream::new(mem, conv);
                         if let Ok(Some(task)) = dreamer.maybe_trigger().await {
                             // Run the consolidation subagent in a background Tokio
-                            // task. We use the AgentTool execute path (via
-                            // poll_background_agent / BACKGROUND_AGENTS) to avoid
+                            // task. We use the AgentTool execute path (tracked
+                            // in the core background task registry) to avoid
                             // re-entering run_query_loop from within the same
                             // future graph.
                             let agent_input = serde_json::json!({
@@ -1951,7 +2041,10 @@ pub async fn run_query_loop(
     }
 }
 
-/// Execute a single tool invocation.
+/// Default timeout for tool execution (5 minutes)
+const TOOL_TIMEOUT_MS: u64 = 300_000;
+
+/// Execute a single tool invocation with a timeout to prevent hanging.
 async fn execute_tool(
     name: &str,
     input: &Value,
@@ -1963,7 +2056,22 @@ async fn execute_tool(
     match tool {
         Some(tool) => {
             debug!(tool = name, "Executing tool");
-            tool.execute(input.clone(), ctx).await
+            
+            // Wrap tool execution in a timeout to prevent indefinite hangs
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(TOOL_TIMEOUT_MS),
+                tool.execute(input.clone(), ctx)
+            ).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    warn!(tool = name, "Tool execution timed out after {}ms", TOOL_TIMEOUT_MS);
+                    ToolResult::error(format!(
+                        "Tool '{}' timed out after {}ms. The operation took too long to complete.",
+                        name,
+                        TOOL_TIMEOUT_MS
+                    ))
+                }
+            }
         }
         None => {
             warn!(tool = name, "Unknown tool requested");

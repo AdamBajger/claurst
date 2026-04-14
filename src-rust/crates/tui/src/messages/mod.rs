@@ -18,7 +18,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 mod markdown;
-pub use markdown::render_markdown;
+pub use markdown::{render_markdown, render_markdown_streaming};
 
 mod markdown_enhanced;
 pub use markdown_enhanced::{
@@ -271,7 +271,7 @@ pub fn render_transcript_assistant_meta(meta: Option<&TurnMetadata>, accent: Col
 
 pub fn render_transcript_live_text(text: &str, width: u16) -> Vec<Line<'static>> {
     indent_lines(
-        render_markdown(text, width.saturating_sub(4)),
+        render_markdown_streaming(text, width.saturating_sub(4)),
         "   ",
         Style::default(),
         TRANSCRIPT_TEXT,

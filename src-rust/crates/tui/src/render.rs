@@ -382,6 +382,9 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     let size = frame.area();
     app.last_selectable_area.set(size);
 
+    // Ensure symbols from previous frames are removed before drawing widgets.
+    frame.render_widget(Clear, size);
+
     // Fill the entire frame with a black background so the terminal's default
     // color (blue on Windows) doesn't bleed through cells not covered by widgets.
     frame.render_widget(
@@ -964,6 +967,9 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
 
     // Track scroll offset for selection validation
     app.last_render_scroll_offset.set(scroll as u16);
+
+    // Virtual list only paints visible rows, so clear the viewport first.
+    frame.render_widget(Clear, msg_area);
 
     list.render(msg_area, frame.buffer_mut());
 
@@ -1728,21 +1734,19 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
 }
 
 fn should_render_status_row(app: &App) -> bool {
-    let interesting_stream_status = app
+    let has_status_message = app
         .status_message
         .as_deref()
         .map(|status| {
             let trimmed = status.trim();
             !trimmed.is_empty()
-                && !trimmed.eq_ignore_ascii_case("thinking")
-                && !trimmed.eq_ignore_ascii_case("thinking…")
         })
         .unwrap_or(false);
 
     app.voice_recording
+        || app.is_streaming
         || app.last_turn_elapsed.is_some()
-        || (!app.is_streaming && app.status_message.is_some())
-        || (app.is_streaming && interesting_stream_status)
+        || has_status_message
 }
 
 fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {

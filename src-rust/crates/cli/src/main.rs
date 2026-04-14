@@ -1259,6 +1259,7 @@ async fn run_interactive(
     use claurst_bridge::{BridgeOutbound, TuiBridgeEvent};
     use claurst_query::{QueryEvent, QueryOutcome};
     use claurst_tui::{
+        app::SystemMessageStyle,
         bridge_state::BridgeConnectionState, notifications::NotificationKind,
         render::render_app, restore_terminal, setup_terminal, App,
         device_auth_dialog::DeviceAuthEvent,
@@ -2780,8 +2781,7 @@ async fn run_interactive(
 
         if task_finished {
             if let Some((handle, msgs_arc)) = current_query.take() {
-                // Get the outcome (ignore errors for now)
-                let _ = handle.await;
+                let outcome = handle.await;
                 // Sync the updated conversation back to our local vector
                 messages = msgs_arc.lock().await.clone();
                 session.messages = messages.clone();
@@ -2789,7 +2789,42 @@ async fn run_interactive(
                 session.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 session.working_dir = Some(tool_ctx.working_dir.display().to_string());
                 app.is_streaming = false;
-                app.status_message = None;
+
+                match outcome {
+                    Ok(QueryOutcome::EndTurn { .. }) => {}
+                    Ok(QueryOutcome::Cancelled) => {
+                        let msg = "Query cancelled.".to_string();
+                        app.status_message = Some(msg.clone());
+                        app.push_system_message(msg, SystemMessageStyle::Warning);
+                    }
+                    Ok(QueryOutcome::MaxTokens { .. }) => {
+                        let msg = "Response stopped at output token limit.".to_string();
+                        app.status_message = Some(msg.clone());
+                        app.push_system_message(msg, SystemMessageStyle::Warning);
+                    }
+                    Ok(QueryOutcome::BudgetExceeded { cost_usd, limit_usd }) => {
+                        let msg = format!(
+                            "Budget exceeded: spent ${:.4} (limit ${:.4}).",
+                            cost_usd, limit_usd
+                        );
+                        app.status_message = Some(msg.clone());
+                        app.push_system_message(msg, SystemMessageStyle::Warning);
+                    }
+                    Ok(QueryOutcome::Error(e)) => {
+                        let msg = format!("Query failed: {}", e);
+                        let should_annotate = app.status_message.as_deref() != Some(msg.as_str());
+                        app.status_message = Some(msg.clone());
+                        if should_annotate {
+                            app.push_system_message(msg, SystemMessageStyle::Warning);
+                        }
+                    }
+                    Err(join_err) => {
+                        let msg = format!("Query task crashed: {}", join_err);
+                        app.status_message = Some(msg.clone());
+                        app.push_system_message(msg, SystemMessageStyle::Warning);
+                    }
+                }
+
                 if app.auto_compact_running {
                     app.auto_compact_running = false;
                     // After auto-compact the context was summarised — reset usage.

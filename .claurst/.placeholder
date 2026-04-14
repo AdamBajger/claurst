@@ -1,0 +1,1 @@
+This file keeps the .claurst directory in git so devcontainer can bind-mount it to /home/vscode/.claurst.

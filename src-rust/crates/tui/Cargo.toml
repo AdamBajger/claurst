@@ -16,8 +16,8 @@ message_actions = ["claurst-core/message_actions"]
 quick_search = ["claurst-core/quick_search"]
 away_summary = ["claurst-core/away_summary"]
 hook_prompts = ["claurst-core/hook_prompts"]
-kairos_brief = ["claurst-core/kairos_brief"]
-kairos_channels = ["claurst-core/kairos_channels"]
+kairos_brief = ["claurst-core/kairos_brief", "claurst-tools/kairos_brief"]
+kairos_channels = ["claurst-core/kairos_channels", "claurst-tools/kairos_channels"]
 lodestone = ["claurst-core/lodestone"]
 
 # Agents & Memory features (pass-through from cc-core)

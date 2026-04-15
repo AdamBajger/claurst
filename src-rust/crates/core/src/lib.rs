@@ -3438,6 +3438,7 @@ pub mod codex_oauth;
 pub mod migrations;
 pub mod output_styles;
 pub mod feature_gates;
+pub mod kairos_gate;
 pub mod tips;
 pub mod remote_settings;
 pub mod settings_sync;

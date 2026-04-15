@@ -356,9 +356,22 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// Return true when Kairos brief tools should be exposed in this process.
+pub fn kairos_brief_tools_enabled() -> bool {
+    #[cfg(feature = "kairos_brief")]
+    {
+        claurst_core::kairos_gate::is_kairos_brief_active()
+    }
+
+    #[cfg(not(feature = "kairos_brief"))]
+    {
+        false
+    }
+}
+
 /// Return all built-in tools (excluding AgentTool, which lives in cc-query).
 pub fn all_tools() -> Vec<Box<dyn Tool>> {
-    vec![
+    let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(PtyBashTool),
         Box::new(FileReadTool),
         Box::new(FileEditTool),
@@ -382,15 +395,11 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(ExitPlanModeTool),
         Box::new(PowerShellTool),
         Box::new(SleepTool),
-        Box::new(CronCreateTool),
-        Box::new(CronDeleteTool),
-        Box::new(CronListTool),
         Box::new(EnterWorktreeTool),
         Box::new(ExitWorktreeTool),
         Box::new(ListMcpResourcesTool),
         Box::new(ReadMcpResourceTool),
         Box::new(ToolSearchTool),
-        Box::new(BriefTool),
         Box::new(ConfigTool),
         Box::new(SendMessageTool),
         Box::new(SkillTool),
@@ -405,7 +414,16 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         // Computer Use is only available when compiled with the feature flag.
         #[cfg(feature = "computer-use")]
         Box::new(computer_use::ComputerUseTool),
-    ]
+    ];
+
+    if kairos_brief_tools_enabled() {
+        tools.push(Box::new(CronCreateTool));
+        tools.push(Box::new(CronDeleteTool));
+        tools.push(Box::new(CronListTool));
+        tools.push(Box::new(BriefTool));
+    }
+
+    tools
 }
 
 /// Find a tool by name (case-sensitive).

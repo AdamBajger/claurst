@@ -124,6 +124,8 @@ pub struct QueryConfig {
     pub model_registry: Option<std::sync::Arc<claurst_api::ModelRegistry>>,
     /// Managed agent (manager-executor) configuration.
     pub managed_agents: Option<claurst_core::ManagedAgentConfig>,
+    /// Whether Kairos assistant mode is active for this query session.
+    pub kairos_enabled: bool,
 }
 
 impl Default for QueryConfig {
@@ -150,6 +152,7 @@ impl Default for QueryConfig {
             agent_definition: None,
             model_registry: None,
             managed_agents: None,
+            kairos_enabled: false,
         }
     }
 }

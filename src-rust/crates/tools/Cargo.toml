@@ -45,3 +45,5 @@ nix = { workspace = true }
 
 [features]
 computer-use = ["dep:enigo", "dep:xcap", "dep:image"]
+kairos_brief = ["claurst-core/kairos_brief"]
+kairos_channels = ["claurst-core/kairos_channels"]

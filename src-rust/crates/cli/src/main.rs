@@ -330,6 +330,82 @@ fn resolve_bridge_config(
     bridge_config.is_active().then_some(bridge_config)
 }
 
+fn apply_kairos_bootstrap_to_query_config(
+    qcfg: &mut claurst_query::QueryConfig,
+    kairos_state: &claurst_core::kairos_gate::KairosRuntimeState,
+) {
+    if !kairos_state.brief_enabled {
+        return;
+    }
+
+    qcfg.kairos_enabled = true;
+    qcfg.output_style = claurst_core::system_prompt::OutputStyle::Concise;
+
+    let addendum = claurst_core::kairos_gate::assistant_system_prompt_addendum(
+        kairos_state.proactive_enabled,
+    );
+    qcfg.append_system_prompt = Some(match &qcfg.append_system_prompt {
+        Some(existing) if !existing.trim().is_empty() => {
+            format!("{}\n\n{}", existing, addendum)
+        }
+        _ => addendum,
+    });
+}
+
+async fn wait_for_mcp_settlement(
+    mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    timeout: std::time::Duration,
+) {
+    let Some(manager) = mcp_manager else {
+        return;
+    };
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let statuses = manager.all_statuses();
+        let has_connecting = statuses
+            .values()
+            .any(|s| matches!(s, claurst_mcp::McpServerStatus::Connecting));
+
+        if !has_connecting || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+fn format_query_outcome_for_background(outcome: claurst_query::QueryOutcome) -> (String, bool) {
+    match outcome {
+        claurst_query::QueryOutcome::EndTurn { message, .. } => {
+            (message.get_all_text(), false)
+        }
+        claurst_query::QueryOutcome::MaxTokens { partial_message, .. } => (
+            format!(
+                "Response hit max tokens. Partial output:\n{}",
+                partial_message.get_all_text()
+            ),
+            false,
+        ),
+        claurst_query::QueryOutcome::BudgetExceeded {
+            cost_usd,
+            limit_usd,
+        } => (
+            format!(
+                "Background run stopped: budget limit ${:.4} reached (spent ${:.4}).",
+                limit_usd, cost_usd
+            ),
+            true,
+        ),
+        claurst_query::QueryOutcome::Cancelled => {
+            ("Background run was cancelled.".to_string(), true)
+        }
+        claurst_query::QueryOutcome::Error(e) => {
+            (format!("Background run failed: {}", e), true)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -386,6 +462,10 @@ async fn main() -> anyhow::Result<()> {
             if let Some(named_cmd) = claurst_commands::named_commands::find_named_command(cmd_name) {
                 // Build a minimal CommandContext (named commands are pre-session)
                 let settings = Settings::load().await.unwrap_or_default();
+                let _kairos_state = claurst_core::kairos_gate::initialize_runtime_state(
+                    settings.has_completed_onboarding,
+                )
+                .await;
                 let config = settings.effective_config();
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let cmd_ctx = claurst_commands::CommandContext {
@@ -529,6 +609,20 @@ async fn main() -> anyhow::Result<()> {
     // Determine mode early (needed for auth error handling and permission handler selection).
     let is_headless = cli.print || cli.prompt.is_some();
 
+    let kairos_state = claurst_core::kairos_gate::initialize_runtime_state(
+        settings.has_completed_onboarding,
+    )
+    .await;
+    info!(
+        kairos_brief = kairos_state.brief_enabled,
+        kairos_channels = kairos_state.channels_enabled,
+        kairos_proactive = kairos_state.proactive_enabled,
+        entitlement_checked = kairos_state.entitlement_checked,
+        entitled = kairos_state.entitled,
+        onboarding_completed = settings.has_completed_onboarding,
+        "Kairos runtime state resolved"
+    );
+
     // Initialize API client.
     // Try config/env first; fall back to saved OAuth tokens.
     // If no Anthropic credentials are found, check whether any other provider is
@@ -634,6 +728,9 @@ async fn main() -> anyhow::Result<()> {
     // but we guard with a std::sync::OnceLock internally).
     {
         static SWARM_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if kairos_state.brief_enabled {
+            debug!("Kairos active: pre-seeding team swarm runner");
+        }
         SWARM_INIT.get_or_init(|| claurst_query::init_team_swarm_runner());
     }
 
@@ -701,6 +798,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref fb) = cli.fallback_model {
         query_config.fallback_model = Some(fb.clone());
     }
+    apply_kairos_bootstrap_to_query_config(&mut query_config, &kairos_state);
     // Wire in the provider registry so non-Anthropic providers can be dispatched.
     let provider_registry = std::sync::Arc::new(provider_registry);
     query_config.provider_registry = Some(provider_registry.clone());
@@ -727,16 +825,20 @@ async fn main() -> anyhow::Result<()> {
         tools
     };
 
-    // Spawn the background cron scheduler (fires cron tasks at scheduled times).
+    // Spawn the background cron scheduler only when Kairos tools are active.
     // Cancelled automatically when the process exits since we use a shared token.
     let cron_cancel = tokio_util::sync::CancellationToken::new();
-    claurst_query::start_cron_scheduler(
-        client.clone(),
-        tools.clone(),
-        tool_ctx.clone(),
-        query_config.clone(),
-        cron_cancel.clone(),
-    );
+    if claurst_tools::kairos_brief_tools_enabled() {
+        claurst_query::start_cron_scheduler(
+            client.clone(),
+            tools.clone(),
+            tool_ctx.clone(),
+            query_config.clone(),
+            cron_cancel.clone(),
+        );
+    } else {
+        debug!("Kairos tools disabled; cron scheduler not started");
+    }
 
     // --print mode (headless)
     let result = if is_headless {
@@ -1514,6 +1616,14 @@ async fn run_interactive(
     // Current cancel token (replaced each turn)
     let mut cancel: Option<CancellationToken> = None;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
+    let (bg_slash_tx, mut bg_slash_rx) =
+        mpsc::unbounded_channel::<(String, String, bool)>();
+
+    // Shared command queue used for system/meta injections from asynchronous
+    // completions (tools and Kairos background slash commands).
+    let command_queue = claurst_query::CommandQueue::new();
+    base_query_config.command_queue = Some(command_queue.clone());
+
     type MessagesArc = Arc<tokio::sync::Mutex<Vec<claurst_core::types::Message>>>;
     let mut current_query: Option<(tokio::task::JoinHandle<QueryOutcome>, MessagesArc)> = None;
     // Active effort level (None = use model default / High).
@@ -1678,6 +1788,111 @@ async fn run_interactive(
                             // Honour exit/quit triggered by TUI intercept immediately.
                             if app.should_quit {
                                 break 'main;
+                            }
+
+                            // Kairos Phase 3: run /btw in fire-and-forget mode so
+                            // slash execution does not block the input loop.
+                            if claurst_core::kairos_gate::is_kairos_brief_active()
+                                && cmd_name == "btw"
+                            {
+                                let mut bg_cmd_ctx = CommandContext {
+                                    config: cmd_ctx.config.clone(),
+                                    cost_tracker: cmd_ctx.cost_tracker.clone(),
+                                    messages: messages.clone(),
+                                    working_dir: cmd_ctx.working_dir.clone(),
+                                    session_id: cmd_ctx.session_id.clone(),
+                                    session_title: cmd_ctx.session_title.clone(),
+                                    remote_session_url: cmd_ctx.remote_session_url.clone(),
+                                    mcp_manager: cmd_ctx.mcp_manager.clone(),
+                                };
+
+                                let input_bg = input.clone();
+                                let mut bg_qcfg = base_query_config.clone();
+                                bg_qcfg.model =
+                                    claurst_api::effective_model_for_config(&bg_cmd_ctx.config, &model_registry);
+                                bg_qcfg.max_tokens = bg_cmd_ctx.config.effective_max_tokens();
+                                bg_qcfg.append_system_prompt =
+                                    bg_cmd_ctx.config.append_system_prompt.clone();
+                                bg_qcfg.system_prompt = base_query_config.system_prompt.clone();
+                                bg_qcfg.output_style = bg_cmd_ctx.config.effective_output_style();
+                                bg_qcfg.output_style_prompt =
+                                    bg_cmd_ctx.config.resolve_output_style_prompt();
+                                bg_qcfg.working_directory =
+                                    Some(tool_ctx.working_dir.display().to_string());
+                                let kairos_state = claurst_core::kairos_gate::runtime_state().expect(
+                                    "Kairos runtime state must be initialized before interactive query execution",
+                                );
+                                apply_kairos_bootstrap_to_query_config(&mut bg_qcfg, &kairos_state);
+
+                                let mut bg_tool_ctx = tool_ctx.clone();
+                                bg_tool_ctx.config = bg_cmd_ctx.config.clone();
+
+                                let client_bg = client.clone();
+                                let tools_bg = tools_arc.clone();
+                                let tracker_bg = cost_tracker.clone();
+                                let result_tx = bg_slash_tx.clone();
+
+                                tokio::spawn(async move {
+                                    wait_for_mcp_settlement(
+                                        bg_tool_ctx.mcp_manager.clone(),
+                                        std::time::Duration::from_secs(5),
+                                    )
+                                    .await;
+
+                                    let cmd_result = execute_command(&input_bg, &mut bg_cmd_ctx).await;
+                                    match cmd_result {
+                                        Some(CommandResult::UserMessage(msg)) => {
+                                            let mut bg_messages =
+                                                vec![claurst_core::types::Message::user(msg)];
+                                            let cancel = CancellationToken::new();
+                                            let outcome = claurst_query::run_query_loop(
+                                                client_bg.as_ref(),
+                                                &mut bg_messages,
+                                                tools_bg.as_slice(),
+                                                &bg_tool_ctx,
+                                                &bg_qcfg,
+                                                tracker_bg,
+                                                None,
+                                                cancel,
+                                                None,
+                                            )
+                                            .await;
+                                            let (summary, is_error) =
+                                                format_query_outcome_for_background(outcome);
+                                            let _ = result_tx.send(("btw".to_string(), summary, is_error));
+                                        }
+                                        Some(CommandResult::Message(msg)) => {
+                                            let _ = result_tx.send(("btw".to_string(), msg, false));
+                                        }
+                                        Some(CommandResult::Error(e)) => {
+                                            let _ = result_tx.send(("btw".to_string(), e, true));
+                                        }
+                                        Some(CommandResult::Silent) | None => {
+                                            let _ = result_tx.send((
+                                                "btw".to_string(),
+                                                "Background /btw completed with no output.".to_string(),
+                                                false,
+                                            ));
+                                        }
+                                        Some(other) => {
+                                            let _ = result_tx.send((
+                                                "btw".to_string(),
+                                                format!(
+                                                    "Background /btw returned unsupported result variant: {:?}",
+                                                    other
+                                                ),
+                                                true,
+                                            ));
+                                        }
+                                    }
+                                });
+
+                                app.notifications.push(
+                                    NotificationKind::Info,
+                                    "Queued /btw in background.".to_string(),
+                                    Some(4),
+                                );
+                                continue;
                             }
 
                             // ── Step 2: CLI-layer (real side effects) ──────────────────
@@ -2055,6 +2270,10 @@ async fn run_interactive(
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
                         qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
                         qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
+                        let kairos_state = claurst_core::kairos_gate::runtime_state().expect(
+                            "Kairos runtime state must be initialized before interactive query execution",
+                        );
+                        apply_kairos_bootstrap_to_query_config(&mut qcfg, &kairos_state);
                         // Apply active effort level (set via /effort command).
                         if let Some(level) = current_effort {
                             qcfg.effort_level = Some(level);
@@ -2770,6 +2989,27 @@ async fn run_interactive(
                     app.device_auth_dialog.set_error(msg);
                 }
             }
+        }
+
+        // ---- Drain Kairos background slash completions ----
+        while let Ok((cmd, text, is_error)) = bg_slash_rx.try_recv() {
+            let meta = format!("[Kairos /{} background result]\n{}", cmd, text);
+            command_queue.push(
+                claurst_query::QueuedCommand::InjectSystemMessage(meta.clone()),
+                claurst_query::CommandPriority::Normal,
+            );
+
+            app.notifications.push(
+                if is_error {
+                    NotificationKind::Warning
+                } else {
+                    NotificationKind::Success
+                },
+                format!("Background /{} finished.", cmd),
+                Some(4),
+            );
+
+            app.push_message(claurst_core::types::Message::assistant(meta));
         }
 
         // Check if query task is done; sync messages from the task

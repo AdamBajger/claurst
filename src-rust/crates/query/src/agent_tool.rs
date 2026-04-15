@@ -367,6 +367,7 @@ impl Tool for AgentTool {
             agent_definition: None,
             model_registry: Some(model_registry),
             managed_agents: None,
+            kairos_enabled: claurst_core::kairos_gate::is_kairos_brief_active(),
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
@@ -627,6 +628,7 @@ pub fn init_team_swarm_runner() {
                     output_style_prompt: ctx.config.resolve_output_style_prompt(),
                     provider_registry: Some(Arc::new(provider_registry)),
                     model_registry: Some(model_registry),
+                    kairos_enabled: claurst_core::kairos_gate::is_kairos_brief_active(),
                     ..Default::default()
                 };
 

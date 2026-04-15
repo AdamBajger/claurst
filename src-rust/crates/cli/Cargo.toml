@@ -7,6 +7,18 @@ edition.workspace = true
 name = "claurst"
 path = "src/main.rs"
 
+[features]
+kairos_brief = [
+	"claurst-core/kairos_brief",
+	"claurst-tools/kairos_brief",
+	"claurst-tui/kairos_brief",
+]
+kairos_channels = [
+	"claurst-core/kairos_channels",
+	"claurst-tools/kairos_channels",
+	"claurst-tui/kairos_channels",
+]
+
 [dependencies]
 claurst-core = { workspace = true, features = ["voice"] }
 claurst-api = { workspace = true }

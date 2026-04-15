@@ -20,10 +20,22 @@ fi
 #
 # For multiple keys, separate them with newlines inside the variable.
 if [[ -n "${AUTHORIZED_KEYS:-}" ]]; then
-    echo "${AUTHORIZED_KEYS}" > /home/claurst/.ssh/authorized_keys
-    chmod 600 /home/claurst/.ssh/authorized_keys
-    chown claurst:claurst /home/claurst/.ssh/authorized_keys
-    echo "[entrypoint] Installed $(wc -l < /home/claurst/.ssh/authorized_keys) authorized key(s)."
+    _tmp_keys=$(mktemp)
+    echo "${AUTHORIZED_KEYS}" > "${_tmp_keys}"
+    # Validate that every non-blank, non-comment line is a parseable SSH public key.
+    if ! ssh-keygen -l -f "${_tmp_keys}" > /dev/null 2>&1; then
+        echo "[entrypoint] ERROR: AUTHORIZED_KEYS contains invalid SSH public key data." >&2
+        echo "[entrypoint]        No authorized_keys file written; logins will be rejected." >&2
+        rm -f "${_tmp_keys}"
+        # Continue starting sshd so the container stays alive for diagnostics.
+    else
+        mv "${_tmp_keys}" /home/claurst/.ssh/authorized_keys
+        chmod 600 /home/claurst/.ssh/authorized_keys
+        chown claurst:claurst /home/claurst/.ssh/authorized_keys
+        echo "[entrypoint] Installed $(wc -l < /home/claurst/.ssh/authorized_keys) authorized key(s)."
+        _tmp_keys=""
+    fi
+    [[ -n "${_tmp_keys:-}" ]] && rm -f "${_tmp_keys}"
 else
     echo "[entrypoint] WARNING: AUTHORIZED_KEYS is not set." >&2
     echo "[entrypoint]          No SSH public keys installed; logins will be rejected." >&2

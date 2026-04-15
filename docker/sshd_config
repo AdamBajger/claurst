@@ -16,7 +16,7 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitEmptyPasswords no
 
-# ── Session behaviour ─────────────────────────────────────────────────────────
+# ── Session behavior ─────────────────────────────────────────────────────────
 # Launch the claurst runtime for every SSH session regardless of what command
 # the client requested.
 ForceCommand /usr/local/bin/claurst

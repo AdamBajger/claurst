@@ -33,7 +33,9 @@ AllowAgentForwarding no
 
 # ── Environment ───────────────────────────────────────────────────────────────
 # Let clients propagate locale and CLAURST_* variables through the session.
-AcceptEnv LANG LC_* CLAURST_* ANTHROPIC_API_KEY OPENAI_API_KEY
+# API keys should be configured inside claurst with /connect rather than
+# forwarded as environment variables to limit exposure in process listings.
+AcceptEnv LANG LC_* CLAURST_*
 
 # ── Keep-alive ────────────────────────────────────────────────────────────────
 ClientAliveInterval 30

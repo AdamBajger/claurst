@@ -20,22 +20,38 @@ fi
 #
 # For multiple keys, separate them with newlines inside the variable.
 if [[ -n "${AUTHORIZED_KEYS:-}" ]]; then
+    _tmp_line=$(mktemp)
     _tmp_keys=$(mktemp)
-    echo "${AUTHORIZED_KEYS}" > "${_tmp_keys}"
-    # Validate that every non-blank, non-comment line is a parseable SSH public key.
-    if ! ssh-keygen -l -f "${_tmp_keys}" > /dev/null 2>&1; then
-        echo "[entrypoint] ERROR: AUTHORIZED_KEYS contains invalid SSH public key data." >&2
-        echo "[entrypoint]        No authorized_keys file written; logins will be rejected." >&2
-        rm -f "${_tmp_keys}"
-        # Continue starting sshd so the container stays alive for diagnostics.
-    else
+    _valid=0
+    _invalid=0
+    while IFS= read -r _line; do
+        # Skip blank lines and comments.
+        [[ -z "${_line}" || "${_line}" =~ ^[[:space:]]*# ]] && continue
+        printf '%s\n' "${_line}" > "${_tmp_line}"
+        if ssh-keygen -l -f "${_tmp_line}" > /dev/null 2>&1; then
+            printf '%s\n' "${_line}" >> "${_tmp_keys}"
+            _valid=$(( _valid + 1 ))
+        else
+            echo "[entrypoint] WARNING: Skipping invalid SSH key entry." >&2
+            _invalid=$(( _invalid + 1 ))
+        fi
+    done <<< "${AUTHORIZED_KEYS}"
+    rm -f "${_tmp_line}"
+    if [[ "${_valid}" -gt 0 ]]; then
         mv "${_tmp_keys}" /home/claurst/.ssh/authorized_keys
         chmod 600 /home/claurst/.ssh/authorized_keys
         chown claurst:claurst /home/claurst/.ssh/authorized_keys
-        echo "[entrypoint] Installed $(wc -l < /home/claurst/.ssh/authorized_keys) authorized key(s)."
-        _tmp_keys=""
+        if [[ "${_invalid}" -gt 0 ]]; then
+            echo "[entrypoint] Installed ${_valid} authorized key(s); ${_invalid} invalid key(s) were skipped."
+        else
+            echo "[entrypoint] Installed ${_valid} authorized key(s)."
+        fi
+    else
+        rm -f "${_tmp_keys}"
+        echo "[entrypoint] ERROR: No valid SSH keys found in AUTHORIZED_KEYS." >&2
+        echo "[entrypoint]        Logins will be rejected." >&2
     fi
-    [[ -n "${_tmp_keys:-}" ]] && rm -f "${_tmp_keys}"
+    unset _tmp_line _tmp_keys _valid _invalid _line
 else
     echo "[entrypoint] WARNING: AUTHORIZED_KEYS is not set." >&2
     echo "[entrypoint]          No SSH public keys installed; logins will be rejected." >&2

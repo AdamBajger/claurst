@@ -1,0 +1,148 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "claurst.fullname" . }}
+  labels:
+    {{- include "claurst.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "claurst.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "claurst.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "claurst.serviceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: claurst
+          image: {{ include "claurst.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: ssh
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          env:
+            # SSH authorized keys — read by entrypoint.sh to populate
+            # /home/claurst/.ssh/authorized_keys on container startup.
+            - name: AUTHORIZED_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "claurst.secretName" . }}
+                  key: authorized-keys
+            # ── AI provider API keys ─────────────────────────────────────────
+            {{- if .Values.apiKeys.anthropic }}
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "claurst.secretName" . }}
+                  key: anthropic-api-key
+            {{- end }}
+            {{- if .Values.apiKeys.openai }}
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "claurst.secretName" . }}
+                  key: openai-api-key
+            {{- end }}
+            {{- if .Values.apiKeys.googleAi }}
+            - name: GOOGLE_AI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "claurst.secretName" . }}
+                  key: google-ai-api-key
+            {{- end }}
+            {{- if .Values.apiKeys.groq }}
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "claurst.secretName" . }}
+                  key: groq-api-key
+            {{- end }}
+            {{- if .Values.apiKeys.deepseek }}
+            - name: DEEPSEEK_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "claurst.secretName" . }}
+                  key: deepseek-api-key
+            {{- end }}
+            {{- if .Values.apiKeys.mistral }}
+            - name: MISTRAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "claurst.secretName" . }}
+                  key: mistral-api-key
+            {{- end }}
+            {{- if .Values.apiKeys.githubToken }}
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "claurst.secretName" . }}
+                  key: github-token
+            {{- end }}
+            # ── Extra env vars from ConfigMap ────────────────────────────────
+            {{- if .Values.extraEnv }}
+            {{- range $key, $value := .Values.extraEnv }}
+            - name: {{ $key }}
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "claurst.configMapName" $ }}
+                  key: {{ $key }}
+            {{- end }}
+            {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- if .Values.persistence.enabled }}
+            # Persist SSH host keys so the fingerprint does not change on restart.
+            - name: ssh-hostkeys
+              mountPath: /etc/ssh
+            {{- end }}
+      volumes:
+        {{- if .Values.persistence.enabled }}
+        - name: ssh-hostkeys
+          persistentVolumeClaim:
+            claimName: {{ include "claurst.pvcName" . }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

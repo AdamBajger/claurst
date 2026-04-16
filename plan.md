@@ -19,6 +19,7 @@ infrastructure rather than building a parallel orchestration system. The manager
 is simply a query loop whose system prompt instructs it to delegate via
 `AgentTool`, and `AgentTool` already supports per-agent model overrides.
 
+
 ## 2. Architecture
 
 ### 2.1 High-Level Message Flow

@@ -1,5 +1,99 @@
+pub fn apply_kairos_bootstrap_to_query_config(
+    qcfg: &mut QueryConfig,
+    kairos_state: &claurst_core::kairos_gate::KairosRuntimeState,
+) {
+    if !kairos_state.brief_enabled {
+        return;
+    }
+
+    qcfg.kairos_enabled = true;
+    qcfg.output_style = claurst_core::system_prompt::OutputStyle::Concise;
+
+    let addendum = claurst_core::kairos_gate::assistant_system_prompt_addendum(
+        kairos_state.proactive_enabled,
+    );
+    qcfg.append_system_prompt = Some(match &qcfg.append_system_prompt {
+        Some(existing) if !existing.trim().is_empty() => {
+            format!("{}\n\n{}", existing, addendum)
+        }
+        _ => addendum,
+    });
+}
+
+pub fn format_query_outcome_for_background(outcome: QueryOutcome) -> (String, bool) {
+    match outcome {
+        QueryOutcome::EndTurn { message, .. } => {
+            (message.get_all_text(), false)
+        }
+        QueryOutcome::MaxTokens { partial_message, .. } => (
+            format!(
+                "Response hit max tokens. Partial output:\n{}",
+                partial_message.get_all_text()
+            ),
+            false,
+        ),
+        QueryOutcome::BudgetExceeded {
+            cost_usd,
+            limit_usd,
+        } => (
+            format!(
+                "Background run stopped: budget limit ${:.4} reached (spent ${:.4}).",
+                limit_usd, cost_usd
+            ),
+            true,
+        ),
+        QueryOutcome::Cancelled => {
+            ("Background run was cancelled.".to_string(), true)
+        }
+        QueryOutcome::Error(e) => {
+            (format!("Background run failed: {}", e), true)
+        }
+    }
+}
+/// Shared background runner for agent/cron tasks, reusing the slash command substrate.
+pub fn spawn_background_agent_task(
+    task_id: String,
+    prompt: String,
+    base_query_config: &QueryConfig,
+    tool_ctx: &ToolContext,
+    client: Arc<claurst_api::AnthropicClient>,
+    tools: Arc<Vec<Box<dyn Tool>>>,
+    cost_tracker: Arc<claurst_core::cost::CostTracker>,
+    _model_registry: Arc<claurst_api::ModelRegistry>,
+    result_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String, bool)>>,
+) {
+    let mut bg_qcfg = base_query_config.clone();
+    let kairos_state = claurst_core::kairos_gate::runtime_state().expect(
+        "Kairos runtime state must be initialized before background agent execution",
+    );
+    apply_kairos_bootstrap_to_query_config(&mut bg_qcfg, &kairos_state);
+
+    let bg_tool_ctx = tool_ctx.clone();
+
+    tokio::spawn(async move {
+        // No MCP settlement needed for cron/agent tasks
+        let mut bg_messages = vec![claurst_core::types::Message::user(prompt)];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let outcome = run_query_loop(
+            client.as_ref(),
+            &mut bg_messages,
+            &tools,
+            &bg_tool_ctx,
+            &bg_qcfg,
+            cost_tracker,
+            None, // background — no UI event channel
+            cancel,
+            None, // no pending message queue for cron tasks
+        ).await;
+
+        let (summary, is_error) = format_query_outcome_for_background(outcome);
+        if let Some(tx) = result_tx {
+            let _ = tx.send((task_id, summary, is_error));
+        }
+    });
+}
+
 // cc-query: The core agentic query loop.
-//
 // This crate implements the main conversation loop that:
 // 1. Sends messages to the Anthropic API
 // 2. Processes streaming responses

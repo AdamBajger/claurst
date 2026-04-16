@@ -304,3 +304,31 @@ Since `--all-features` already compiles everything:
 | **Production ready** | No (experimental only) |
 
 **Bottom line**: Kairos mode compiles and works, but the feature flags don't actually gate anything. The tools are always available once built. To make them truly optional, add `#[cfg(feature = "...")]` guards around tool registration.
+
+---
+
+## Progress Addendum (feature/kairos-mode)
+
+This document started as a baseline snapshot. The items below track code changes applied after that snapshot.
+
+### 2026-04-16 — Applied Changes
+
+### 2026-04-16 — Unified cron/agent background execution substrate
+
+- Refactored the cron scheduler to use the same background runner as slash commands (`spawn_background_agent_task`).
+- Exposed a new function in CLI for background agent/cron tasks, reusing the slash command substrate.
+- All background agent/cron execution now flows through a single substrate, simplifying future agent management and session/report tracking.
+
+- Introduced strict runtime Kairos gating and initialization in `src-rust/crates/core/src/kairos_gate.rs`.
+- Wired startup initialization order in `src-rust/crates/cli/src/main.rs` (both normal and named-command paths).
+- Gated Kairos tool exposure in `src-rust/crates/tools/src/lib.rs`.
+- Added assistant bootstrap behavior and query-config propagation in `src-rust/crates/cli/src/main.rs` and `src-rust/crates/query/src/lib.rs`.
+- Added async background command path for `/btw`, including MCP settlement wait and completion requeue.
+- Added command execution policy metadata in `src-rust/crates/commands/src/lib.rs`.
+- Replaced hardcoded `/btw` route with policy-based background routing in `src-rust/crates/cli/src/main.rs`.
+- Extracted reusable helper `spawn_background_slash_command(...)` in `src-rust/crates/cli/src/main.rs` as shared background-runner foundation.
+
+### Validation
+
+- `cargo check -p claurst` passed.
+- `cargo check -p claurst --features kairos_brief` passed.

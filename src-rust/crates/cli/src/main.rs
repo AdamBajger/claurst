@@ -330,27 +330,6 @@ fn resolve_bridge_config(
     bridge_config.is_active().then_some(bridge_config)
 }
 
-fn apply_kairos_bootstrap_to_query_config(
-    qcfg: &mut claurst_query::QueryConfig,
-    kairos_state: &claurst_core::kairos_gate::KairosRuntimeState,
-) {
-    if !kairos_state.brief_enabled {
-        return;
-    }
-
-    qcfg.kairos_enabled = true;
-    qcfg.output_style = claurst_core::system_prompt::OutputStyle::Concise;
-
-    let addendum = claurst_core::kairos_gate::assistant_system_prompt_addendum(
-        kairos_state.proactive_enabled,
-    );
-    qcfg.append_system_prompt = Some(match &qcfg.append_system_prompt {
-        Some(existing) if !existing.trim().is_empty() => {
-            format!("{}\n\n{}", existing, addendum)
-        }
-        _ => addendum,
-    });
-}
 
 async fn wait_for_mcp_settlement(
     mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
@@ -375,35 +354,99 @@ async fn wait_for_mcp_settlement(
     }
 }
 
-fn format_query_outcome_for_background(outcome: claurst_query::QueryOutcome) -> (String, bool) {
-    match outcome {
-        claurst_query::QueryOutcome::EndTurn { message, .. } => {
-            (message.get_all_text(), false)
+
+fn spawn_background_slash_command(
+    cmd_name: String,
+    input: String,
+    cmd_ctx: &claurst_commands::CommandContext,
+    base_query_config: &claurst_query::QueryConfig,
+    tool_ctx: &claurst_tools::ToolContext,
+    client: Arc<claurst_api::AnthropicClient>,
+    tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
+    cost_tracker: Arc<CostTracker>,
+    model_registry: Arc<claurst_api::ModelRegistry>,
+    result_tx: tokio::sync::mpsc::UnboundedSender<(String, String, bool)>,
+) {
+    let mut bg_cmd_ctx = claurst_commands::CommandContext {
+        config: cmd_ctx.config.clone(),
+        cost_tracker: cmd_ctx.cost_tracker.clone(),
+        messages: cmd_ctx.messages.clone(),
+        working_dir: cmd_ctx.working_dir.clone(),
+        session_id: cmd_ctx.session_id.clone(),
+        session_title: cmd_ctx.session_title.clone(),
+        remote_session_url: cmd_ctx.remote_session_url.clone(),
+        mcp_manager: cmd_ctx.mcp_manager.clone(),
+    };
+
+    let mut bg_qcfg = base_query_config.clone();
+    bg_qcfg.model = claurst_api::effective_model_for_config(&bg_cmd_ctx.config, &model_registry);
+    bg_qcfg.max_tokens = bg_cmd_ctx.config.effective_max_tokens();
+    bg_qcfg.append_system_prompt = bg_cmd_ctx.config.append_system_prompt.clone();
+    bg_qcfg.system_prompt = base_query_config.system_prompt.clone();
+    bg_qcfg.output_style = bg_cmd_ctx.config.effective_output_style();
+    bg_qcfg.output_style_prompt = bg_cmd_ctx.config.resolve_output_style_prompt();
+    bg_qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
+    let kairos_state = claurst_core::kairos_gate::runtime_state().expect(
+        "Kairos runtime state must be initialized before interactive query execution",
+    );
+    claurst_query::apply_kairos_bootstrap_to_query_config(&mut bg_qcfg, &kairos_state);
+
+    let mut bg_tool_ctx = tool_ctx.clone();
+    bg_tool_ctx.config = bg_cmd_ctx.config.clone();
+    let bg_cmd_name = cmd_name;
+
+    tokio::spawn(async move {
+        wait_for_mcp_settlement(
+            bg_tool_ctx.mcp_manager.clone(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        let cmd_result = claurst_commands::execute_command(&input, &mut bg_cmd_ctx).await;
+        match cmd_result {
+            Some(claurst_commands::CommandResult::UserMessage(msg)) => {
+                let mut bg_messages = vec![claurst_core::types::Message::user(msg)];
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let outcome = claurst_query::run_query_loop(
+                    client.as_ref(),
+                    &mut bg_messages,
+                    tools.as_slice(),
+                    &bg_tool_ctx,
+                    &bg_qcfg,
+                    cost_tracker,
+                    None,
+                    cancel,
+                    None,
+                )
+                .await;
+                let (summary, is_error) = claurst_query::format_query_outcome_for_background(outcome);
+                let _ = result_tx.send((bg_cmd_name.clone(), summary, is_error));
+            }
+            Some(claurst_commands::CommandResult::Message(msg)) => {
+                let _ = result_tx.send((bg_cmd_name.clone(), msg, false));
+            }
+            Some(claurst_commands::CommandResult::Error(e)) => {
+                let _ = result_tx.send((bg_cmd_name.clone(), e, true));
+            }
+            Some(claurst_commands::CommandResult::Silent) | None => {
+                let _ = result_tx.send((
+                    bg_cmd_name.clone(),
+                    format!("Background /{} completed with no output.", bg_cmd_name),
+                    false,
+                ));
+            }
+            Some(other) => {
+                let _ = result_tx.send((
+                    bg_cmd_name.clone(),
+                    format!(
+                        "Background /{} returned unsupported result variant: {:?}",
+                        bg_cmd_name, other
+                    ),
+                    true,
+                ));
+            }
         }
-        claurst_query::QueryOutcome::MaxTokens { partial_message, .. } => (
-            format!(
-                "Response hit max tokens. Partial output:\n{}",
-                partial_message.get_all_text()
-            ),
-            false,
-        ),
-        claurst_query::QueryOutcome::BudgetExceeded {
-            cost_usd,
-            limit_usd,
-        } => (
-            format!(
-                "Background run stopped: budget limit ${:.4} reached (spent ${:.4}).",
-                limit_usd, cost_usd
-            ),
-            true,
-        ),
-        claurst_query::QueryOutcome::Cancelled => {
-            ("Background run was cancelled.".to_string(), true)
-        }
-        claurst_query::QueryOutcome::Error(e) => {
-            (format!("Background run failed: {}", e), true)
-        }
-    }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -798,7 +841,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref fb) = cli.fallback_model {
         query_config.fallback_model = Some(fb.clone());
     }
-    apply_kairos_bootstrap_to_query_config(&mut query_config, &kairos_state);
+    claurst_query::apply_kairos_bootstrap_to_query_config(&mut query_config, &kairos_state);
     // Wire in the provider registry so non-Anthropic providers can be dispatched.
     let provider_registry = std::sync::Arc::new(provider_registry);
     query_config.provider_registry = Some(provider_registry.clone());
@@ -1357,7 +1400,10 @@ async fn run_interactive(
     has_credentials: bool,
     model_registry: Arc<claurst_api::ModelRegistry>,
 ) -> anyhow::Result<()> {
-    use claurst_commands::{execute_command, CommandContext, CommandResult};
+    use claurst_commands::{
+        execute_command, find_command_execution_policy, CommandContext,
+        CommandExecutionPolicy, CommandResult,
+    };
     use claurst_bridge::{BridgeOutbound, TuiBridgeEvent};
     use claurst_query::{QueryEvent, QueryOutcome};
     use claurst_tui::{
@@ -1790,106 +1836,30 @@ async fn run_interactive(
                                 break 'main;
                             }
 
-                            // Kairos Phase 3: run /btw in fire-and-forget mode so
-                            // slash execution does not block the input loop.
+                            // Kairos Phase 3.1: route background-safe slash commands
+                            // through a fire-and-forget path so execution does not
+                            // block the interactive input loop.
+                            let execution_policy = find_command_execution_policy(&cmd_name)
+                                .unwrap_or(CommandExecutionPolicy::ForegroundOnly);
                             if claurst_core::kairos_gate::is_kairos_brief_active()
-                                && cmd_name == "btw"
+                                && execution_policy == CommandExecutionPolicy::BackgroundSafe
                             {
-                                let mut bg_cmd_ctx = CommandContext {
-                                    config: cmd_ctx.config.clone(),
-                                    cost_tracker: cmd_ctx.cost_tracker.clone(),
-                                    messages: messages.clone(),
-                                    working_dir: cmd_ctx.working_dir.clone(),
-                                    session_id: cmd_ctx.session_id.clone(),
-                                    session_title: cmd_ctx.session_title.clone(),
-                                    remote_session_url: cmd_ctx.remote_session_url.clone(),
-                                    mcp_manager: cmd_ctx.mcp_manager.clone(),
-                                };
-
-                                let input_bg = input.clone();
-                                let mut bg_qcfg = base_query_config.clone();
-                                bg_qcfg.model =
-                                    claurst_api::effective_model_for_config(&bg_cmd_ctx.config, &model_registry);
-                                bg_qcfg.max_tokens = bg_cmd_ctx.config.effective_max_tokens();
-                                bg_qcfg.append_system_prompt =
-                                    bg_cmd_ctx.config.append_system_prompt.clone();
-                                bg_qcfg.system_prompt = base_query_config.system_prompt.clone();
-                                bg_qcfg.output_style = bg_cmd_ctx.config.effective_output_style();
-                                bg_qcfg.output_style_prompt =
-                                    bg_cmd_ctx.config.resolve_output_style_prompt();
-                                bg_qcfg.working_directory =
-                                    Some(tool_ctx.working_dir.display().to_string());
-                                let kairos_state = claurst_core::kairos_gate::runtime_state().expect(
-                                    "Kairos runtime state must be initialized before interactive query execution",
+                                spawn_background_slash_command(
+                                    cmd_name.clone(),
+                                    input.clone(),
+                                    &cmd_ctx,
+                                    &base_query_config,
+                                    &tool_ctx,
+                                    client.clone(),
+                                    tools_arc.clone(),
+                                    cost_tracker.clone(),
+                                    model_registry.clone(),
+                                    bg_slash_tx.clone(),
                                 );
-                                apply_kairos_bootstrap_to_query_config(&mut bg_qcfg, &kairos_state);
-
-                                let mut bg_tool_ctx = tool_ctx.clone();
-                                bg_tool_ctx.config = bg_cmd_ctx.config.clone();
-
-                                let client_bg = client.clone();
-                                let tools_bg = tools_arc.clone();
-                                let tracker_bg = cost_tracker.clone();
-                                let result_tx = bg_slash_tx.clone();
-
-                                tokio::spawn(async move {
-                                    wait_for_mcp_settlement(
-                                        bg_tool_ctx.mcp_manager.clone(),
-                                        std::time::Duration::from_secs(5),
-                                    )
-                                    .await;
-
-                                    let cmd_result = execute_command(&input_bg, &mut bg_cmd_ctx).await;
-                                    match cmd_result {
-                                        Some(CommandResult::UserMessage(msg)) => {
-                                            let mut bg_messages =
-                                                vec![claurst_core::types::Message::user(msg)];
-                                            let cancel = CancellationToken::new();
-                                            let outcome = claurst_query::run_query_loop(
-                                                client_bg.as_ref(),
-                                                &mut bg_messages,
-                                                tools_bg.as_slice(),
-                                                &bg_tool_ctx,
-                                                &bg_qcfg,
-                                                tracker_bg,
-                                                None,
-                                                cancel,
-                                                None,
-                                            )
-                                            .await;
-                                            let (summary, is_error) =
-                                                format_query_outcome_for_background(outcome);
-                                            let _ = result_tx.send(("btw".to_string(), summary, is_error));
-                                        }
-                                        Some(CommandResult::Message(msg)) => {
-                                            let _ = result_tx.send(("btw".to_string(), msg, false));
-                                        }
-                                        Some(CommandResult::Error(e)) => {
-                                            let _ = result_tx.send(("btw".to_string(), e, true));
-                                        }
-                                        Some(CommandResult::Silent) | None => {
-                                            let _ = result_tx.send((
-                                                "btw".to_string(),
-                                                "Background /btw completed with no output.".to_string(),
-                                                false,
-                                            ));
-                                        }
-                                        Some(other) => {
-                                            let _ = result_tx.send((
-                                                "btw".to_string(),
-                                                format!(
-                                                    "Background /btw returned unsupported result variant: {:?}",
-                                                    other
-                                                ),
-                                                true,
-                                            ));
-                                        }
-                                    }
-                                });
 
                                 app.notifications.push(
                                     NotificationKind::Info,
-                                    "Queued /btw in background.".to_string(),
+                                    format!("Queued /{} in background.", cmd_name),
                                     Some(4),
                                 );
                                 continue;
@@ -2273,7 +2243,7 @@ async fn run_interactive(
                         let kairos_state = claurst_core::kairos_gate::runtime_state().expect(
                             "Kairos runtime state must be initialized before interactive query execution",
                         );
-                        apply_kairos_bootstrap_to_query_config(&mut qcfg, &kairos_state);
+                        claurst_query::apply_kairos_bootstrap_to_query_config(&mut qcfg, &kairos_state);
                         // Apply active effort level (set via /effort command).
                         if let Some(level) = current_effort {
                             qcfg.effort_level = Some(level);

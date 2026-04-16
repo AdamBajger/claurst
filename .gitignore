@@ -15,6 +15,7 @@ refs/
 .gitattributes
 
 # VSCode / unsolicited devcontainers mounts
-.vscode/
-.claurst/
+.vscode
+.vscode/settings.json
+.claurst
 

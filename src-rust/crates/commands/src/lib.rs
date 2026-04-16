@@ -74,6 +74,15 @@ pub enum CommandResult {
     SpeechMode { mode: Option<String>, level: String },
 }
 
+/// Execution policy for slash commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandExecutionPolicy {
+    /// Command must run on the interactive foreground path.
+    ForegroundOnly,
+    /// Command may run on a detached background path.
+    BackgroundSafe,
+}
+
 /// Every slash command implements this trait.
 #[async_trait]
 pub trait SlashCommand: Send + Sync {
@@ -92,6 +101,11 @@ pub trait SlashCommand: Send + Sync {
     /// Whether this command is visible in /help output.
     fn hidden(&self) -> bool {
         false
+    }
+    /// Execution policy used by the CLI to decide whether the command can run
+    /// in a background worker.
+    fn execution_policy(&self) -> CommandExecutionPolicy {
+        CommandExecutionPolicy::ForegroundOnly
     }
     /// Execute the command with the given arguments string.
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult;
@@ -6911,6 +6925,9 @@ impl SlashCommand for TeleportCommand {
 impl SlashCommand for BtwCommand {
     fn name(&self) -> &str { "btw" }
     fn description(&self) -> &str { "Ask a side question without adding it to conversation history" }
+    fn execution_policy(&self) -> CommandExecutionPolicy {
+        CommandExecutionPolicy::BackgroundSafe
+    }
     fn help(&self) -> &str {
         "Usage: /btw <question>\n\n\
          Submits a background question to the model without it becoming part of\n\
@@ -8123,6 +8140,11 @@ pub fn find_command(name: &str) -> Option<Box<dyn SlashCommand>> {
     })
 }
 
+/// Resolve execution policy for a built-in slash command by name/alias.
+pub fn find_command_execution_policy(name: &str) -> Option<CommandExecutionPolicy> {
+    find_command(name).map(|cmd| cmd.execution_policy())
+}
+
 /// Build `HelpEntry` values for all non-hidden commands, suitable for
 /// populating `HelpOverlay::commands` at startup.
 pub fn build_help_entries() -> Vec<claurst_tui::overlays::HelpEntry> {
@@ -8363,6 +8385,18 @@ mod tests {
     #[test]
     fn test_find_command_not_found() {
         assert!(find_command("nonexistent_command_xyz").is_none());
+    }
+
+    #[test]
+    fn test_command_execution_policy_lookup() {
+        assert_eq!(
+            find_command_execution_policy("btw"),
+            Some(CommandExecutionPolicy::BackgroundSafe)
+        );
+        assert_eq!(
+            find_command_execution_policy("clear"),
+            Some(CommandExecutionPolicy::ForegroundOnly)
+        );
     }
 
     #[test]

@@ -250,3 +250,39 @@ Kairos is considered fully functional when all conditions below are true:
 - Transcript/history persistence is durable and lazily retrievable.
 - Cron scheduler is observable, controllable, and configurable.
 - Non-Kairos user workflows remain unchanged.
+
+## Implementation Progress Log
+
+### 2026-04-16 — Phase 1 (Gate Foundation) Completed
+
+- Added centralized Kairos runtime gate state in `src-rust/crates/core/src/kairos_gate.rs`.
+- Added strict runtime-state initialization contract (no fallback reads after startup).
+- Initialized runtime state in both startup paths in `src-rust/crates/cli/src/main.rs`.
+- Propagated compile-time Kairos feature flags through Cargo manifests.
+
+### 2026-04-16 — Phase 2 (Assistant Bootstrap) Completed
+
+- Added `apply_kairos_bootstrap_to_query_config(...)` in `src-rust/crates/cli/src/main.rs`.
+- Enforced concise output mode when Kairos brief is active.
+- Appended assistant-mode addendum from `claurst_core::kairos_gate::assistant_system_prompt_addendum(...)`.
+- Added `kairos_enabled` session flag to query config in `src-rust/crates/query/src/lib.rs`.
+
+### 2026-04-16 — Phase 3.0 (Async Background Slice) Completed
+
+- Added detached background execution path for `/btw` in interactive CLI loop.
+- Added MCP settlement wait prior to detached execution.
+- Added background completion reinjection via command queue and TUI notification.
+
+### 2026-04-16 — Phase 3.1 (Policy + Shared Runner Foundation) Completed
+
+- Added `CommandExecutionPolicy` in `src-rust/crates/commands/src/lib.rs`.
+- Added default `SlashCommand::execution_policy()` with foreground default.
+- Marked `/btw` as `BackgroundSafe` and added policy lookup test coverage.
+- Replaced hardcoded `/btw` branch in CLI with policy-based background routing.
+- Extracted reusable shared helper `spawn_background_slash_command(...)` in `src-rust/crates/cli/src/main.rs`.
+
+### Next Planned Increment
+
+- Promote shared background helper into generic AgentRunRequest-style runner interface.
+- Wire cron-triggered execution to the shared runner substrate.
+- Add persisted run/session records for inspection and reporting.

@@ -8,15 +8,17 @@
 // One-shot tasks (recurring=false) are automatically removed from the store
 // by `pop_due_tasks` after they are returned.
 
-use crate::{QueryConfig, QueryOutcome, run_query_loop};
-use claurst_core::types::Message;
+use crate::{QueryConfig};
 use claurst_tools::Tool;
 use claurst_tools::ToolContext;
 use chrono::Timelike;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
+
+// Import the background agent runner from CLI
+use crate::spawn_background_agent_task;
 
 /// Start the background cron scheduler.
 ///
@@ -70,52 +72,18 @@ async fn run_scheduler_loop(
 
         for task in due {
             info!(id = %task.id, cron = %task.cron, "Firing cron task");
-
-            let client = client.clone();
-            let tools = tools.clone();
-            let tool_ctx = tool_ctx.clone();
-            let query_config = query_config.clone();
-            let cost_tracker = tool_ctx.cost_tracker.clone();
-            let cancel_child = cancel.clone();
-            let task_id = task.id.clone();
-
-            tokio::spawn(async move {
-                let mut messages = vec![Message::user(task.prompt.clone())];
-
-                let outcome = run_query_loop(
-                    client.as_ref(),
-                    &mut messages,
-                    &tools,
-                    &tool_ctx,
-                    &query_config,
-                    cost_tracker,
-                    None, // background — no UI event channel
-                    cancel_child,
-                    None, // no pending message queue for cron tasks
-                )
-                .await;
-
-                match outcome {
-                    QueryOutcome::EndTurn { .. } => {
-                        info!(id = %task_id, "Cron task completed");
-                    }
-                    QueryOutcome::Error(e) => {
-                        error!(id = %task_id, error = %e, "Cron task failed");
-                    }
-                    QueryOutcome::MaxTokens { .. } => {
-                        info!(id = %task_id, "Cron task hit max tokens");
-                    }
-                    QueryOutcome::Cancelled => {
-                        debug!(id = %task_id, "Cron task cancelled");
-                    }
-                    QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => {
-                        eprintln!(
-                            "[cron] task {} budget exceeded: spent ${:.4} of ${:.4}",
-                            task_id, cost_usd, limit_usd
-                        );
-                    }
-                }
-            });
+            // Use the shared background agent runner from CLI
+            spawn_background_agent_task(
+                task.id.clone(),
+                task.prompt.clone(),
+                &query_config,
+                &tool_ctx,
+                client.clone(),
+                tools.clone(),
+                tool_ctx.cost_tracker.clone(),
+                Arc::new(claurst_api::ModelRegistry::default()), // TODO: wire real registry if needed
+                None,
+            );
         }
     }
 }

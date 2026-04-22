@@ -359,15 +359,15 @@ fn spawn_background_slash_command(
     cmd_name: String,
     input: String,
     cmd_ctx: &claurst_commands::CommandContext,
-    base_query_config: &claurst_query::QueryConfig,
+    query_config: &claurst_query::QueryConfig,
     tool_ctx: &claurst_tools::ToolContext,
     client: Arc<claurst_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
-    cost_tracker: Arc<CostTracker>,
-    model_registry: Arc<claurst_api::ModelRegistry>,
-    result_tx: tokio::sync::mpsc::UnboundedSender<(String, String, bool)>,
+    result_tx: tokio::sync::mpsc::UnboundedSender<claurst_query::AgentRunResult>,
 ) {
-    let mut bg_cmd_ctx = claurst_commands::CommandContext {
+    use claurst_query::{AgentRunContext, AgentRunRequest, AgentRunResult, AgentRunSource, execute_agent_run};
+
+    let bg_cmd_ctx = claurst_commands::CommandContext {
         config: cmd_ctx.config.clone(),
         cost_tracker: cmd_ctx.cost_tracker.clone(),
         messages: cmd_ctx.messages.clone(),
@@ -378,22 +378,9 @@ fn spawn_background_slash_command(
         mcp_manager: cmd_ctx.mcp_manager.clone(),
     };
 
-    let mut bg_qcfg = base_query_config.clone();
-    bg_qcfg.model = claurst_api::effective_model_for_config(&bg_cmd_ctx.config, &model_registry);
-    bg_qcfg.max_tokens = bg_cmd_ctx.config.effective_max_tokens();
-    bg_qcfg.append_system_prompt = bg_cmd_ctx.config.append_system_prompt.clone();
-    bg_qcfg.system_prompt = base_query_config.system_prompt.clone();
-    bg_qcfg.output_style = bg_cmd_ctx.config.effective_output_style();
-    bg_qcfg.output_style_prompt = bg_cmd_ctx.config.resolve_output_style_prompt();
-    bg_qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
-    let kairos_state = claurst_core::kairos_gate::runtime_state().expect(
-        "Kairos runtime state must be initialized before interactive query execution",
-    );
-    claurst_query::apply_kairos_bootstrap_to_query_config(&mut bg_qcfg, &kairos_state);
-
-    let mut bg_tool_ctx = tool_ctx.clone();
-    bg_tool_ctx.config = bg_cmd_ctx.config.clone();
-    let bg_cmd_name = cmd_name;
+    // query_config already has Kairos bootstrap applied from startup — do not re-apply.
+    let bg_query_config = query_config.clone();
+    let bg_tool_ctx = tool_ctx.clone();
 
     tokio::spawn(async move {
         wait_for_mcp_settlement(
@@ -402,48 +389,37 @@ fn spawn_background_slash_command(
         )
         .await;
 
+        let mut bg_cmd_ctx = bg_cmd_ctx;
         let cmd_result = claurst_commands::execute_command(&input, &mut bg_cmd_ctx).await;
+
+        let run_id = cmd_name.clone();
+        let source = AgentRunSource::SlashCommand { name: cmd_name };
+
         match cmd_result {
             Some(claurst_commands::CommandResult::UserMessage(msg)) => {
-                let mut bg_messages = vec![claurst_core::types::Message::user(msg)];
-                let cancel = tokio_util::sync::CancellationToken::new();
-                let outcome = claurst_query::run_query_loop(
-                    client.as_ref(),
-                    &mut bg_messages,
-                    tools.as_slice(),
-                    &bg_tool_ctx,
-                    &bg_qcfg,
-                    cost_tracker,
-                    None,
-                    cancel,
-                    None,
-                )
-                .await;
-                let (summary, is_error) = claurst_query::format_query_outcome_for_background(outcome);
-                let _ = result_tx.send((bg_cmd_name.clone(), summary, is_error));
+                let ctx = AgentRunContext {
+                    query_config: bg_query_config,
+                    tool_ctx: bg_tool_ctx,
+                    client,
+                    tools,
+                    result_tx: Some(result_tx),
+                };
+                execute_agent_run(AgentRunRequest { run_id, source, prompt: msg }, ctx).await;
             }
             Some(claurst_commands::CommandResult::Message(msg)) => {
-                let _ = result_tx.send((bg_cmd_name.clone(), msg, false));
+                let _ = result_tx.send(AgentRunResult { run_id, source, output: msg, is_error: false });
             }
             Some(claurst_commands::CommandResult::Error(e)) => {
-                let _ = result_tx.send((bg_cmd_name.clone(), e, true));
+                let _ = result_tx.send(AgentRunResult { run_id, source, output: e, is_error: true });
             }
-            Some(claurst_commands::CommandResult::Silent) | None => {
-                let _ = result_tx.send((
-                    bg_cmd_name.clone(),
-                    format!("Background /{} completed with no output.", bg_cmd_name),
-                    false,
-                ));
-            }
+            Some(claurst_commands::CommandResult::Silent) | None => {}
             Some(other) => {
-                let _ = result_tx.send((
-                    bg_cmd_name.clone(),
-                    format!(
-                        "Background /{} returned unsupported result variant: {:?}",
-                        bg_cmd_name, other
-                    ),
-                    true,
-                ));
+                let _ = result_tx.send(AgentRunResult {
+                    run_id,
+                    source,
+                    output: format!("Unexpected background command result: {:?}", other),
+                    is_error: true,
+                });
             }
         }
     });
@@ -868,20 +844,22 @@ async fn main() -> anyhow::Result<()> {
         tools
     };
 
-    // Spawn the background cron scheduler only when Kairos tools are active.
-    // Cancelled automatically when the process exits since we use a shared token.
-    let cron_cancel = tokio_util::sync::CancellationToken::new();
-    if claurst_tools::kairos_brief_tools_enabled() {
-        claurst_query::start_cron_scheduler(
-            client.clone(),
-            tools.clone(),
-            tool_ctx.clone(),
-            query_config.clone(),
-            cron_cancel.clone(),
-        );
+    // Kairos session bridge: if brief mode is active and no explicit --resume was
+    // given, check for an active bridge pointer in the current working directory
+    // and auto-resume that session. Stale pointer cleanup runs concurrently.
+    let bridge_resume_id = if kairos_state.brief_enabled && cli.resume.is_none() {
+        tokio::spawn(claurst_core::cleanup_stale_pointers());
+        claurst_core::find_active_pointer(&cwd).await.map(|p| {
+            info!(
+                session_id = %p.session_id,
+                last_active = %p.last_active_at.format("%Y-%m-%d %H:%M UTC"),
+                "Kairos bridge: auto-resuming active session"
+            );
+            p.session_id
+        })
     } else {
-        debug!("Kairos tools disabled; cron scheduler not started");
-    }
+        None
+    };
 
     // --print mode (headless)
     let result = if is_headless {
@@ -909,7 +887,7 @@ async fn main() -> anyhow::Result<()> {
             tool_ctx,
             query_config,
             cost_tracker,
-            cli.resume,
+            cli.resume.or(bridge_resume_id),
             bridge_config,
             has_credentials,
             model_registry,
@@ -917,7 +895,6 @@ async fn main() -> anyhow::Result<()> {
         .await
     };
 
-    cron_cancel.cancel();
     result
 }
 
@@ -1662,8 +1639,39 @@ async fn run_interactive(
     // Current cancel token (replaced each turn)
     let mut cancel: Option<CancellationToken> = None;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
-    let (bg_slash_tx, mut bg_slash_rx) =
-        mpsc::unbounded_channel::<(String, String, bool)>();
+    let (bg_task_tx, mut bg_task_rx) =
+        mpsc::unbounded_channel::<claurst_query::AgentRunResult>();
+
+    // Tracks last bridge pointer write time for debouncing (write at most every 30s).
+    let mut last_bridge_write = chrono::Utc::now() - chrono::Duration::hours(24);
+
+    // Cron scheduler: started only when Kairos tools are active. Cancelled when
+    // the interactive loop exits so the background task drops cleanly.
+    let cron_cancel = CancellationToken::new();
+    if claurst_tools::kairos_brief_tools_enabled() {
+        claurst_query::start_cron_scheduler(
+            client.clone(),
+            tools_arc.clone(),
+            tool_ctx.clone(),
+            base_query_config.clone(),
+            Some(bg_task_tx.clone()),
+            cron_cancel.clone(),
+        );
+    } else {
+        debug!("Kairos tools disabled; cron scheduler not started");
+    }
+
+    let proactive_cancel = CancellationToken::new();
+    if claurst_core::kairos_gate::is_kairos_proactive_active() {
+        claurst_query::start_proactive_ticker(
+            base_query_config.clone(),
+            tool_ctx.clone(),
+            client.clone(),
+            tools_arc.clone(),
+            bg_task_tx.clone(),
+            proactive_cancel.clone(),
+        );
+    }
 
     // Shared command queue used for system/meta injections from asynchronous
     // completions (tools and Kairos background slash commands).
@@ -1836,9 +1844,6 @@ async fn run_interactive(
                                 break 'main;
                             }
 
-                            // Kairos Phase 3.1: route background-safe slash commands
-                            // through a fire-and-forget path so execution does not
-                            // block the interactive input loop.
                             let execution_policy = find_command_execution_policy(&cmd_name)
                                 .unwrap_or(CommandExecutionPolicy::ForegroundOnly);
                             if claurst_core::kairos_gate::is_kairos_brief_active()
@@ -1852,9 +1857,7 @@ async fn run_interactive(
                                     &tool_ctx,
                                     client.clone(),
                                     tools_arc.clone(),
-                                    cost_tracker.clone(),
-                                    model_registry.clone(),
-                                    bg_slash_tx.clone(),
+                                    bg_task_tx.clone(),
                                 );
 
                                 app.notifications.push(
@@ -2961,24 +2964,24 @@ async fn run_interactive(
             }
         }
 
-        // ---- Drain Kairos background slash completions ----
-        while let Ok((cmd, text, is_error)) = bg_slash_rx.try_recv() {
-            let meta = format!("[Kairos /{} background result]\n{}", cmd, text);
+        // ---- Drain Kairos background task completions ----
+        while let Ok(result) = bg_task_rx.try_recv() {
+            use claurst_query::AgentRunSource;
+            let label = match &result.source {
+                AgentRunSource::SlashCommand { name } => format!("/{}", name),
+                AgentRunSource::Cron { task_id } => format!("cron:{}", task_id),
+                AgentRunSource::Proactive => "kairos".to_string(),
+            };
+            let meta = format!("[Kairos {} background result]\n{}", label, result.output);
             command_queue.push(
                 claurst_query::QueuedCommand::InjectSystemMessage(meta.clone()),
                 claurst_query::CommandPriority::Normal,
             );
-
             app.notifications.push(
-                if is_error {
-                    NotificationKind::Warning
-                } else {
-                    NotificationKind::Success
-                },
-                format!("Background /{} finished.", cmd),
+                if result.is_error { NotificationKind::Warning } else { NotificationKind::Success },
+                format!("Background {} finished.", label),
                 Some(4),
             );
-
             app.push_message(claurst_core::types::Message::assistant(meta));
         }
 
@@ -3009,6 +3012,21 @@ async fn run_interactive(
 
                 // Save session to JSONL (primary storage)
                 let _ = claurst_core::history::save_session(&session).await;
+
+                // Kairos bridge: update pointer so next startup can auto-resume.
+                // Debounced: at most one disk write per 30 seconds.
+                if claurst_core::kairos_gate::is_kairos_brief_active() {
+                    let now = chrono::Utc::now();
+                    if (now - last_bridge_write).num_seconds() >= 30 {
+                        last_bridge_write = now;
+                        let sid = session.id.clone();
+                        let wdir = tool_ctx.working_dir.clone();
+                        let started = session.created_at;
+                        tokio::spawn(async move {
+                            claurst_core::upsert_bridge_pointer(&sid, &wdir, started).await;
+                        });
+                    }
+                }
 
                 // Also index into SQLite for /search support
                 {
@@ -3068,6 +3086,8 @@ async fn run_interactive(
         }
     }
 
+    proactive_cancel.cancel();
+    cron_cancel.cancel();
     if let Some(runtime) = bridge_runtime.take() {
         runtime.cancel.cancel();
     }

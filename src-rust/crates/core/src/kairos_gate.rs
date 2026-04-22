@@ -11,6 +11,51 @@ pub struct KairosRuntimeState {
     pub proactive_enabled: bool,
     pub entitlement_checked: bool,
     pub entitled: bool,
+    /// Frozen at `resolve_runtime_state` time so `/kairos` can explain *why*
+    /// a gate is on or off without re-reading env/flags mid-session.
+    pub diagnostics: KairosGateDiagnostics,
+}
+
+/// Per-input breakdown that fed into gate decisions. Use `format_summary` to
+/// render a human-readable status block.
+#[derive(Debug, Clone, Default)]
+pub struct KairosGateDiagnostics {
+    pub brief_feature_compiled: bool,
+    pub channels_feature_compiled: bool,
+    pub env_kairos: bool,
+    pub env_brief: bool,
+    pub env_channels: bool,
+    pub env_proactive: bool,
+    pub trusted: bool,
+    pub trust_bypass: bool,
+    pub forced: bool,
+    pub require_entitlement: bool,
+    pub entitlement_ok: bool,
+}
+
+impl KairosGateDiagnostics {
+    /// Human-readable multi-line summary suitable for `/kairos` output.
+    pub fn format_summary(&self) -> String {
+        let yn = |b: bool| if b { "yes" } else { "no" };
+        format!(
+            "  brief_feature_compiled = {}\n  \
+               channels_feature_compiled = {}\n  \
+               env KAIROS={} KAIROS_BRIEF={} KAIROS_CHANNELS={} KAIROS_PROACTIVE={}\n  \
+               trusted = {} (trust_bypass={})\n  \
+               forced = {} require_entitlement = {} entitlement_ok = {}",
+            yn(self.brief_feature_compiled),
+            yn(self.channels_feature_compiled),
+            yn(self.env_kairos),
+            yn(self.env_brief),
+            yn(self.env_channels),
+            yn(self.env_proactive),
+            yn(self.trusted),
+            yn(self.trust_bypass),
+            yn(self.forced),
+            yn(self.require_entitlement),
+            yn(self.entitlement_ok),
+        )
+    }
 }
 
 impl Default for KairosRuntimeState {
@@ -21,6 +66,7 @@ impl Default for KairosRuntimeState {
             proactive_enabled: false,
             entitlement_checked: false,
             entitled: false,
+            diagnostics: KairosGateDiagnostics::default(),
         }
     }
 }
@@ -71,6 +117,19 @@ pub async fn resolve_runtime_state(has_completed_onboarding: bool) -> KairosRunt
         proactive_enabled,
         entitlement_checked,
         entitled,
+        diagnostics: KairosGateDiagnostics {
+            brief_feature_compiled: brief_feature_enabled,
+            channels_feature_compiled: channels_feature_enabled,
+            env_kairos,
+            env_brief,
+            env_channels,
+            env_proactive,
+            trusted,
+            trust_bypass,
+            forced,
+            require_entitlement,
+            entitlement_ok,
+        },
     }
 }
 
@@ -104,6 +163,38 @@ pub fn is_kairos_channels_active() -> bool {
 
 pub fn is_kairos_proactive_active() -> bool {
     require_runtime_state().proactive_enabled
+}
+
+/// Tick interval for proactive mode, in seconds.
+/// Read from KAIROS_PROACTIVE_INTERVAL_SECS; defaults to 900 (15 min); clamped to [60, 3600].
+pub fn proactive_interval_secs() -> u64 {
+    std::env::var("KAIROS_PROACTIVE_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(900)
+        .clamp(60, 3600)
+}
+
+/// Per-tick spend ceiling for proactive mode, in USD.
+/// Read from `KAIROS_TICK_MAX_USD`; returns `None` if unset/invalid/non-positive,
+/// meaning no ceiling. A single tick whose delta exceeds this value counts as an
+/// overrun and contributes to the shutdown strike counter in `proactive_ticker`.
+pub fn proactive_tick_max_usd() -> Option<f64> {
+    std::env::var("KAIROS_TICK_MAX_USD")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+}
+
+/// Prompt sent to the model on each proactive tick.
+/// This is the user-turn message; the system prompt already carries the Kairos addendum.
+pub fn proactive_tick_prompt() -> String {
+    "Kairos proactive tick. Review the current working directory and session context, then take \
+     the most useful autonomous action available: run pending tasks, check for relevant changes \
+     (git status, test results, file modifications), or execute scheduled work. If nothing \
+     requires action, send a Brief notification with your current status. Keep all output \
+     concise."
+        .to_string()
 }
 
 /// Assistant-mode addendum appended to the system prompt when Kairos is active.

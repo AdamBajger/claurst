@@ -20,78 +20,14 @@ pub fn apply_kairos_bootstrap_to_query_config(
     });
 }
 
-pub fn format_query_outcome_for_background(outcome: QueryOutcome) -> (String, bool) {
-    match outcome {
-        QueryOutcome::EndTurn { message, .. } => {
-            (message.get_all_text(), false)
-        }
-        QueryOutcome::MaxTokens { partial_message, .. } => (
-            format!(
-                "Response hit max tokens. Partial output:\n{}",
-                partial_message.get_all_text()
-            ),
-            false,
-        ),
-        QueryOutcome::BudgetExceeded {
-            cost_usd,
-            limit_usd,
-        } => (
-            format!(
-                "Background run stopped: budget limit ${:.4} reached (spent ${:.4}).",
-                limit_usd, cost_usd
-            ),
-            true,
-        ),
-        QueryOutcome::Cancelled => {
-            ("Background run was cancelled.".to_string(), true)
-        }
-        QueryOutcome::Error(e) => {
-            (format!("Background run failed: {}", e), true)
-        }
-    }
-}
-/// Shared background runner for agent/cron tasks, reusing the slash command substrate.
-pub fn spawn_background_agent_task(
-    task_id: String,
-    prompt: String,
-    base_query_config: &QueryConfig,
-    tool_ctx: &ToolContext,
-    client: Arc<claurst_api::AnthropicClient>,
-    tools: Arc<Vec<Box<dyn Tool>>>,
-    cost_tracker: Arc<claurst_core::cost::CostTracker>,
-    _model_registry: Arc<claurst_api::ModelRegistry>,
-    result_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String, bool)>>,
-) {
-    let mut bg_qcfg = base_query_config.clone();
-    let kairos_state = claurst_core::kairos_gate::runtime_state().expect(
-        "Kairos runtime state must be initialized before background agent execution",
-    );
-    apply_kairos_bootstrap_to_query_config(&mut bg_qcfg, &kairos_state);
-
-    let bg_tool_ctx = tool_ctx.clone();
-
-    tokio::spawn(async move {
-        // No MCP settlement needed for cron/agent tasks
-        let mut bg_messages = vec![claurst_core::types::Message::user(prompt)];
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let outcome = run_query_loop(
-            client.as_ref(),
-            &mut bg_messages,
-            &tools,
-            &bg_tool_ctx,
-            &bg_qcfg,
-            cost_tracker,
-            None, // background — no UI event channel
-            cancel,
-            None, // no pending message queue for cron tasks
-        ).await;
-
-        let (summary, is_error) = format_query_outcome_for_background(outcome);
-        if let Some(tx) = result_tx {
-            let _ = tx.send((task_id, summary, is_error));
-        }
-    });
-}
+pub mod background_runner;
+pub mod proactive_ticker;
+pub use background_runner::{
+    AgentRunContext, AgentRunRequest, AgentRunResult, AgentRunSource,
+    execute_agent_run, spawn_agent_run,
+};
+pub use proactive_ticker::start_proactive_ticker;
+pub use claurst_core::task_history::{RunStatus, TaskRunRecord, last_runs};
 
 // cc-query: The core agentic query loop.
 // This crate implements the main conversation loop that:

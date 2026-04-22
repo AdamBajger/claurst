@@ -281,8 +281,76 @@ Kairos is considered fully functional when all conditions below are true:
 - Replaced hardcoded `/btw` branch in CLI with policy-based background routing.
 - Extracted reusable shared helper `spawn_background_slash_command(...)` in `src-rust/crates/cli/src/main.rs`.
 
-### Next Planned Increment
+### 2026-04-20 — Phase 3.2 (Unified Background Runner) Completed
 
-- Promote shared background helper into generic AgentRunRequest-style runner interface.
-- Wire cron-triggered execution to the shared runner substrate.
-- Add persisted run/session records for inspection and reporting.
+- Created `src-rust/crates/query/src/background_runner.rs` with `AgentRunSource`, `AgentRunRequest`, `AgentRunContext`, `AgentRunResult`, `execute_agent_run`, `spawn_agent_run`.
+- Removed `spawn_background_agent_task` from `query/src/lib.rs` (was a duplicate with different parameter bags).
+- Removed redundant query-config field reassignment from the slash-command background path (`model`, `max_tokens`, `output_style`, `output_style_prompt` were already set in the main `query_config`).
+- Fixed double-bootstrap bug: Kairos system prompt addendum was being appended twice for background tasks. Now applied once at startup; `execute_agent_run` does not re-apply.
+- Inlined `run_scheduler_loop` into `start_cron_scheduler` (private passthrough function with one caller).
+- Channel type changed from `(String, String, bool)` tuple to `AgentRunResult` (structured, source-tagged).
+- Renamed `bg_slash_tx/rx` → `bg_task_tx/rx` to reflect that cron and proactive results will flow through the same channel.
+- Silent background commands no longer generate a spurious "completed with no output" notification.
+- Removed stale phase-tracking comment from interactive loop.
+
+### 2026-04-21 — Phase 3.3 (Task Run Records) Completed
+
+- Created `src-rust/crates/query/src/task_history.rs`: `TaskRunRecord`, `RunStatus`, global in-memory ring buffer (100 records, `Lazy<Mutex<VecDeque>>`), `record_run`, `last_runs`.
+- Disk persistence: JSONL append to `~/.claurst/kairos_run_history.jsonl` on each completion.
+- Wired `record_run` into `execute_agent_run` in `background_runner.rs`: records start time, source label, prompt preview, output snippet, status.
+- In-memory buffer updated even when disk write fails (errors logged, not swallowed).
+- `last_runs(n)` exposed from `claurst-query` crate for future use in `/kairos status` command.
+- Simplification pass: removed unnecessary `Arc` wrapper from global history static; separated disk append into `append_to_disk` helper; silent `create_dir_all` error now logged and exits early.
+
+### 2026-04-21 — Phase 4 (Proactive Autonomous Loop) Completed
+
+- Added `proactive_interval_secs()` (reads `KAIROS_PROACTIVE_INTERVAL_SECS`, default 900, clamped [60, 3600]) and `proactive_tick_prompt()` to `crates/core/src/kairos_gate.rs`.
+- Created `crates/query/src/proactive_ticker.rs`: `start_proactive_ticker()` runs a sequential tick loop — sleep → execute → record → repeat. No concurrent proactive tasks possible by design.
+- Backoff: `MAX_CONSECUTIVE_ERRORS` (3) consecutive errors doubles the sleep interval; resets to base on success. Warns once at threshold.
+- `execute_agent_run` return type changed `() → bool` (is_error) so ticker can track outcomes.
+- Proactive ticker started in `run_interactive` after `bg_task_tx` creation; results flow through same `AgentRunResult` channel as slash commands and cron. Cancelled at session end via `proactive_cancel`.
+- Existing drain loop in `run_interactive` already handles `AgentRunSource::Proactive` label — no TUI changes needed.
+- Simplification pass: removed redundant startup log (ticker logs itself with interval).
+
+### 2026-04-21 — Phase 5: Session Bridge + Resume Completed
+
+- `core/src/session_bridge.rs`: `BridgePointer`, `upsert_bridge_pointer`, `find_active_pointer`, `cleanup_stale_pointers`.
+- Bridge files at `~/.claurst/bridge/{session_id}.json`, TTL-gated (env `KAIROS_BRIDGE_TTL_SECS`, default 4h).
+- Auto-resume on startup: scans CWD-matching live pointers, merges with `--resume` flag (explicit wins).
+- Pointer written after each session save with 30s debounce. Stale cleanup runs concurrently at startup.
+
+### 2026-04-21 — Phase 6: Cron UX + Config Completed
+
+- `cron_scheduler::start_cron_scheduler` now accepts `result_tx: Option<mpsc::UnboundedSender<AgentRunResult>>` and passes it into every `AgentRunContext`. Cron output merges into the same TUI drain loop as proactive ticks and background slash commands.
+- Cron scheduler start moved from outer `main()` into `run_interactive` so it shares the interactive `bg_task_tx` directly; headless/--print mode no longer starts a minute-ticker it would never use. Cancelled via a local `CancellationToken` on loop exit.
+- Promoted `task_history` from `claurst-query` to `claurst-core`. `claurst-tools` now depends on it without pulling a cycle; `claurst-query` keeps `pub use claurst_core::task_history::*` so existing call sites stay working.
+- Added `claurst_core::task_history::last_runs_by_cron_id(scan_limit)` — returns `HashMap<task_id, TaskRunRecord>` of most recent run per cron id. Single helper used by `CronList` and `/kairos`.
+- `CronListTool` output now shows `last_run=<UTC ts> (ok|err)` or `last_run=never` per row. `execute` body collapsed to call new `cron::list_tasks()` snapshot helper instead of inlining the read/sort.
+- Cron job cap now reads `KAIROS_MAX_CRON_JOBS` (default 50, clamped [1, 1000]); error message names the env var so users can raise it.
+- `/kairos` slash command added (`commands/src/lib.rs`): prints gate state, active cron jobs with last_run, and N most recent background run records. Optional numeric arg (default 10, clamped [1, 100]). Registered in `all_commands()` and under "System" category.
+- Simplification pass: extracted `cron::list_tasks()` so `CronListTool` and `/kairos` share the snapshot/sort logic; extracted `last_runs_by_cron_id` so both call sites share the cron-id indexing (removed two near-identical loops).
+
+### 2026-04-21 — Phase 7: Hardening Completed
+
+- **Unit tests** (16 new, all green):
+  - `crates/tools/src/cron.rs` — 9 tests covering `validate_cron` (accept/reject paths) and `cron_matches` (every-minute, step, specific, range, list, Sunday alias 7≡0, wrong field count).
+  - `crates/core/src/session_bridge.rs` — 5 tests: `BridgePointer` JSON round-trip, `is_stale` past vs. recent, `bridge_ttl_secs` clamps below 60s, `matches_dir` exact equality.
+  - `crates/core/src/task_history.rs` — 2 tests: `TaskRunRecord` JSON round-trip, `last_runs_by_cron_id` filters non-cron sources and buckets by id (newest wins per id).
+- **Gate decision diagnostics**: introduced `KairosGateDiagnostics` stored on `KairosRuntimeState` at `resolve_runtime_state` time. Captures compile features, each env var value, trust + bypass, forced / require_entitlement / entitlement_ok. Struct carries its own `format_summary()` so `/kairos` renders inputs verbatim without recomputing state mid-session.
+- **Proactive loop cost guardrail**: added `kairos_gate::proactive_tick_max_usd()` (reads `KAIROS_TICK_MAX_USD`; unset/non-positive = `None` = no ceiling). `proactive_ticker` now snapshots `total_cost_usd` around each tick; a single-tick delta over the ceiling counts as an overrun. After `MAX_COST_OVERRUNS = 2` consecutive overruns the ticker logs a warning and exits. Successful under-ceiling tick resets the strike counter.
+- **Scope cuts** (not implemented, documented as deferred):
+  - Integration tests (restart+resume, parallel background, entitlement transitions) — require a full E2E harness; separate initiative.
+  - Prompt dedupe across ticks — the proactive prompt is static, so dedupe would suppress every tick; not meaningful.
+  - Cron scheduler pause/resume/inspect slash commands — `/kairos` + `CronDelete` cover current needs; can be added on demand.
+  - Transcript segment writes + lazy history load — still a carry-over candidate but distinct from Kairos hardening; track separately.
+- **Simplification pass**: diagnostics rendering lives on the struct (`format_summary`) so `/kairos` gains one call, not a reimplementation. Cost ceiling returns `Option<f64>` so "unset" and "invalid" collapse to the same branch.
+
+### Kairos Status
+
+All roadmap phases (1 through 7) are complete for the "brief + proactive + cron + bridge" slice. Remaining work is outside the Phase 1–7 scope:
+- `kairos_channels` feature — flag only, no implementation. Distinct feature.
+- Integration test harness — infra task.
+- Focus-aware behavior — deferred product decision.
+- Transcript segment writes / lazy history — persistence layer work, orthogonal to Kairos.
+
+Kairos meets the Definition of Done criteria for: gated activation, consistent assistant bootstrap, async background tasks with TUI visibility, proactive loop with pacing and cost guardrails, pointer-based session recovery, observable + configurable cron, and non-Kairos paths unchanged.

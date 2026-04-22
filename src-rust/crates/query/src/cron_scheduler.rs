@@ -8,82 +8,71 @@
 // One-shot tasks (recurring=false) are automatically removed from the store
 // by `pop_due_tasks` after they are returned.
 
-use crate::{QueryConfig};
-use claurst_tools::Tool;
-use claurst_tools::ToolContext;
+use crate::background_runner::{
+    AgentRunContext, AgentRunRequest, AgentRunResult, AgentRunSource, spawn_agent_run,
+};
+use crate::QueryConfig;
+use claurst_tools::{Tool, ToolContext};
 use chrono::Timelike;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-// Import the background agent runner from CLI
-use crate::spawn_background_agent_task;
-
-/// Start the background cron scheduler.
-///
-/// Returns immediately; the scheduler runs as a detached tokio task.
+/// Starts the background cron scheduler as a detached tokio task.
 /// Call `cancel.cancel()` to stop it gracefully.
+/// `result_tx` is forwarded to each fired task so its output reaches the TUI
+/// drain loop; pass `None` for headless contexts with no drain.
 pub fn start_cron_scheduler(
     client: Arc<claurst_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn Tool>>>,
     tool_ctx: ToolContext,
     query_config: QueryConfig,
+    result_tx: Option<mpsc::UnboundedSender<AgentRunResult>>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
-        run_scheduler_loop(client, tools, tool_ctx, query_config, cancel).await;
-    });
-}
+        info!("Cron scheduler started");
 
-async fn run_scheduler_loop(
-    client: Arc<claurst_api::AnthropicClient>,
-    tools: Arc<Vec<Box<dyn Tool>>>,
-    tool_ctx: ToolContext,
-    query_config: QueryConfig,
-    cancel: CancellationToken,
-) {
-    info!("Cron scheduler started");
+        loop {
+            let now = chrono::Local::now();
+            let secs_into_minute = now.second() as u64;
+            let nanos_ms = now.nanosecond() as u64 / 1_000_000;
+            let ms_to_next_minute = (60u64.saturating_sub(secs_into_minute))
+                .saturating_mul(1_000)
+                .saturating_sub(nanos_ms)
+                .max(1);
 
-    loop {
-        // Sleep until the next whole-minute boundary (±1s tolerance).
-        let now = chrono::Local::now();
-        let secs_into_minute = now.second() as u64;
-        let nanos_ms = now.nanosecond() as u64 / 1_000_000;
-        // How many ms until the next minute starts? Use saturating sub to avoid underflow.
-        let ms_to_next_minute = (60u64.saturating_sub(secs_into_minute))
-            .saturating_mul(1_000)
-            .saturating_sub(nanos_ms)
-            .max(1); // always sleep at least 1ms
+            tokio::select! {
+                _ = sleep(Duration::from_millis(ms_to_next_minute)) => {}
+                _ = cancel.cancelled() => {
+                    info!("Cron scheduler stopped");
+                    return;
+                }
+            }
 
-        tokio::select! {
-            _ = sleep(Duration::from_millis(ms_to_next_minute)) => {}
-            _ = cancel.cancelled() => {
-                info!("Cron scheduler stopped");
-                return;
+            let tick_time = chrono::Local::now();
+            debug!(time = %tick_time.format("%H:%M"), "Cron scheduler tick");
+
+            for task in claurst_tools::cron::pop_due_tasks(&tick_time).await {
+                info!(id = %task.id, cron = %task.cron, "Firing cron task");
+                let run_id = task.id.clone();
+                spawn_agent_run(
+                    AgentRunRequest {
+                        run_id,
+                        source: AgentRunSource::Cron { task_id: task.id },
+                        prompt: task.prompt,
+                    },
+                    AgentRunContext {
+                        query_config: query_config.clone(),
+                        tool_ctx: tool_ctx.clone(),
+                        client: client.clone(),
+                        tools: tools.clone(),
+                        result_tx: result_tx.clone(),
+                    },
+                );
             }
         }
-
-        let tick_time = chrono::Local::now();
-        debug!(time = %tick_time.format("%H:%M"), "Cron scheduler tick");
-
-        // Find tasks due at this minute.
-        let due = claurst_tools::cron::pop_due_tasks(&tick_time).await;
-
-        for task in due {
-            info!(id = %task.id, cron = %task.cron, "Firing cron task");
-            // Use the shared background agent runner from CLI
-            spawn_background_agent_task(
-                task.id.clone(),
-                task.prompt.clone(),
-                &query_config,
-                &tool_ctx,
-                client.clone(),
-                tools.clone(),
-                tool_ctx.cost_tracker.clone(),
-                Arc::new(claurst_api::ModelRegistry::default()), // TODO: wire real registry if needed
-                None,
-            );
-        }
-    }
+    });
 }

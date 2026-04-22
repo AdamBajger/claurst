@@ -271,6 +271,7 @@ pub struct AgentCommand;
 pub struct SearchCommand;
 pub struct ForkCommand;
 pub struct ManagedAgentsCommand;
+pub struct KairosCommand;
 pub struct NamedCommandAdapter {
     pub slash_name: &'static str,
     pub target_name: &'static str,
@@ -491,6 +492,7 @@ fn command_category(name: &str) -> &'static str {
         "think-back" | "thinkback-play" | "thinking" | "plan" | "tasks" => "AI & Thinking",
         "copy" | "skills" | "agents" | "plugin" | "reload-plugins"
         | "stickers" | "passes" | "desktop" | "mobile" | "btw" => "Tools & Extras",
+        "kairos" => "System",
         _ => "Other",
     }
 }
@@ -8129,6 +8131,8 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(SearchCommand),
         // Managed agent (manager-executor) architecture
         Box::new(ManagedAgentsCommand),
+        // Kairos mode diagnostics
+        Box::new(KairosCommand),
     ]
 }
 
@@ -8302,6 +8306,113 @@ pub async fn execute_command(
     }
 
     None
+}
+
+// ---------------------------------------------------------------------------
+// /kairos — Kairos mode status (gate, cron jobs, recent background runs)
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for KairosCommand {
+    fn name(&self) -> &str { "kairos" }
+    fn description(&self) -> &str {
+        "Show Kairos mode status: gate, active cron jobs, recent background runs"
+    }
+    fn help(&self) -> &str {
+        "Usage: /kairos [recent]\n\n\
+         Prints Kairos runtime gate state, all scheduled cron tasks with\n\
+         last run timestamp, and the N most recent background run records.\n\
+         Pass an integer to adjust how many recent runs are shown (default 10)."
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let recent_n: usize = args
+            .trim()
+            .parse()
+            .ok()
+            .map(|n: usize| n.clamp(1, 100))
+            .unwrap_or(10);
+
+        let state = claurst_core::kairos_gate::runtime_state();
+
+        let mut out = String::new();
+        out.push_str("Kairos status\n");
+        out.push_str("─────────────\n\n");
+
+        match state {
+            None => {
+                out.push_str("Runtime state: not initialized\n");
+            }
+            Some(s) => {
+                out.push_str("Gate:\n");
+                out.push_str(&format!("  brief_enabled      = {}\n", s.brief_enabled));
+                out.push_str(&format!("  channels_enabled   = {}\n", s.channels_enabled));
+                out.push_str(&format!("  proactive_enabled  = {}\n", s.proactive_enabled));
+                out.push_str(&format!("  entitlement_checked = {}\n", s.entitlement_checked));
+                out.push_str(&format!("  entitled           = {}\n", s.entitled));
+                out.push_str("\nGate inputs (frozen at startup):\n");
+                out.push_str(&s.diagnostics.format_summary());
+                out.push('\n');
+            }
+        }
+
+        // Cron jobs
+        let tasks = claurst_tools::cron::list_tasks().await;
+        out.push_str(&format!("\nCron jobs ({}):\n", tasks.len()));
+        if tasks.is_empty() {
+            out.push_str("  (none scheduled)\n");
+        } else {
+            let last_by_id = claurst_core::task_history::last_runs_by_cron_id(100).await;
+            for t in &tasks {
+                let last = match last_by_id.get(&t.id) {
+                    Some(r) => {
+                        let status = match r.status {
+                            claurst_core::task_history::RunStatus::Success => "ok",
+                            claurst_core::task_history::RunStatus::Error => "err",
+                        };
+                        format!(
+                            "last_run={} ({})",
+                            r.completed_at.format("%Y-%m-%d %H:%M UTC"),
+                            status
+                        )
+                    }
+                    None => "last_run=never".to_string(),
+                };
+                out.push_str(&format!(
+                    "  {} | {} | recurring={} | durable={} | {}\n",
+                    t.id, t.cron, t.recurring, t.durable, last
+                ));
+            }
+        }
+
+        // Recent runs
+        let recent = claurst_core::task_history::last_runs(recent_n).await;
+        out.push_str(&format!("\nRecent background runs (last {}):\n", recent.len()));
+        if recent.is_empty() {
+            out.push_str("  (none yet)\n");
+        } else {
+            for r in &recent {
+                let status = match r.status {
+                    claurst_core::task_history::RunStatus::Success => "ok",
+                    claurst_core::task_history::RunStatus::Error => "err",
+                };
+                let preview = if r.prompt_preview.len() > 60 {
+                    format!("{}…", &r.prompt_preview[..60])
+                } else {
+                    r.prompt_preview.clone()
+                };
+                out.push_str(&format!(
+                    "  [{}] {} ({}) — {}\n",
+                    r.completed_at.format("%H:%M:%S"),
+                    r.source_label,
+                    status,
+                    preview,
+                ));
+            }
+        }
+
+        CommandResult::Message(out)
+    }
 }
 
 // ---------------------------------------------------------------------------

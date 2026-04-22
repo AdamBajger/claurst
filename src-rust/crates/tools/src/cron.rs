@@ -45,6 +45,18 @@ pub struct CronTask {
 /// 7 days in seconds — tasks older than this are purged on load.
 const MAX_TASK_AGE_SECS: u64 = 7 * 24 * 3600;
 
+/// Default cap on concurrently scheduled cron tasks. Tunable via
+/// `KAIROS_MAX_CRON_JOBS` env var; clamped to [1, 1000].
+const DEFAULT_MAX_CRON_JOBS: usize = 50;
+
+fn max_cron_jobs() -> usize {
+    std::env::var("KAIROS_MAX_CRON_JOBS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_CRON_JOBS)
+        .clamp(1, 1000)
+}
+
 /// Whether the store has been initialised from disk for this process.
 static STORE_INITIALISED: once_cell::sync::Lazy<tokio::sync::Mutex<bool>> =
     once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(false));
@@ -316,10 +328,12 @@ impl Tool for CronCreateTool {
         ensure_store_loaded().await;
 
         let mut store = CRON_STORE.write().await;
-        if store.len() >= 50 {
-            return ToolResult::error(
-                "Too many scheduled jobs (max 50). Cancel one first.".to_string(),
-            );
+        let cap = max_cron_jobs();
+        if store.len() >= cap {
+            return ToolResult::error(format!(
+                "Too many scheduled jobs (max {}). Cancel one first or raise KAIROS_MAX_CRON_JOBS.",
+                cap
+            ));
         }
 
         let id = Uuid::new_v4().to_string()[..8].to_string();
@@ -449,28 +463,38 @@ impl Tool for CronListTool {
     }
 
     async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
-        // Merge in-memory store with any persisted tasks from disk.
-        ensure_store_loaded().await;
-
-        let store = CRON_STORE.read().await;
-
-        if store.is_empty() {
+        let tasks_snapshot = list_tasks().await;
+        if tasks_snapshot.is_empty() {
             return ToolResult::success("No scheduled cron tasks.".to_string());
         }
 
-        let mut tasks: Vec<&CronTask> = store.values().collect();
-        tasks.sort_by_key(|t| t.created_at);
+        let last_run_by_id = claurst_core::task_history::last_runs_by_cron_id(100).await;
 
-        let lines: Vec<String> = tasks
+        let lines: Vec<String> = tasks_snapshot
             .iter()
             .map(|t| {
+                let last_note = match last_run_by_id.get(&t.id) {
+                    Some(r) => {
+                        let status = match r.status {
+                            claurst_core::task_history::RunStatus::Success => "ok",
+                            claurst_core::task_history::RunStatus::Error => "err",
+                        };
+                        format!(
+                            " | last_run={} ({})",
+                            r.completed_at.format("%Y-%m-%d %H:%M UTC"),
+                            status
+                        )
+                    }
+                    None => " | last_run=never".to_string(),
+                };
                 format!(
-                    "{} | {} | {} | recurring={} | durable={} | prompt: {}",
+                    "{} | {} | {} | recurring={} | durable={}{} | prompt: {}",
                     t.id,
                     t.cron,
                     cron_to_human(&t.cron),
                     t.recurring,
                     t.durable,
+                    last_note,
                     if t.prompt.len() > 60 {
                         format!("{}…", &t.prompt[..60])
                     } else {
@@ -482,10 +506,20 @@ impl Tool for CronListTool {
 
         ToolResult::success(format!(
             "Scheduled tasks ({}):\n\n{}",
-            tasks.len(),
+            tasks_snapshot.len(),
             lines.join("\n")
         ))
     }
+}
+
+/// Snapshot of all currently scheduled tasks (in-memory + loaded from disk).
+/// Used by `/kairos` to show active cron jobs without going through the tool.
+pub async fn list_tasks() -> Vec<CronTask> {
+    ensure_store_loaded().await;
+    let store = CRON_STORE.read().await;
+    let mut v: Vec<CronTask> = store.values().cloned().collect();
+    v.sort_by_key(|t| t.created_at);
+    v
 }
 
 // ---------------------------------------------------------------------------
@@ -507,4 +541,84 @@ async fn persist_tasks_to_disk(store: &HashMap<String, CronTask>) -> Result<(), 
     tokio::fs::write(&path, json).await.map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn dt(y: i32, m: u32, d: u32, h: u32, min: u32) -> chrono::DateTime<chrono::Local> {
+        chrono::Local.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
+    }
+
+    #[test]
+    fn validate_cron_accepts_basic_forms() {
+        assert!(validate_cron("* * * * *"));
+        assert!(validate_cron("0 0 1 1 0"));
+        assert!(validate_cron("*/5 * * * *"));
+        assert!(validate_cron("0-30 * * * *"));
+        assert!(validate_cron("0 9 15 12 7"));
+    }
+
+    #[test]
+    fn validate_cron_rejects_malformed() {
+        assert!(!validate_cron(""));
+        assert!(!validate_cron("* * * *"));
+        assert!(!validate_cron("* * * * * *"));
+        assert!(!validate_cron("60 * * * *"));
+        assert!(!validate_cron("* 24 * * *"));
+        assert!(!validate_cron("* * 32 * *"));
+        assert!(!validate_cron("* * * 13 *"));
+        assert!(!validate_cron("* * * * 8"));
+        assert!(!validate_cron("*/abc * * * *"));
+        assert!(!validate_cron("foo * * * *"));
+    }
+
+    #[test]
+    fn cron_matches_every_minute() {
+        assert!(cron_matches("* * * * *", &dt(2026, 4, 21, 10, 0)));
+        assert!(cron_matches("* * * * *", &dt(2026, 4, 21, 10, 59)));
+    }
+
+    #[test]
+    fn cron_matches_step_minute() {
+        assert!(cron_matches("*/5 * * * *", &dt(2026, 4, 21, 10, 0)));
+        assert!(cron_matches("*/5 * * * *", &dt(2026, 4, 21, 10, 15)));
+        assert!(!cron_matches("*/5 * * * *", &dt(2026, 4, 21, 10, 3)));
+    }
+
+    #[test]
+    fn cron_matches_specific_time() {
+        assert!(cron_matches("30 14 * * *", &dt(2026, 4, 21, 14, 30)));
+        assert!(!cron_matches("30 14 * * *", &dt(2026, 4, 21, 14, 31)));
+        assert!(!cron_matches("30 14 * * *", &dt(2026, 4, 21, 13, 30)));
+    }
+
+    #[test]
+    fn cron_matches_range() {
+        assert!(cron_matches("0 9-17 * * *", &dt(2026, 4, 21, 12, 0)));
+        assert!(cron_matches("0 9-17 * * *", &dt(2026, 4, 21, 17, 0)));
+        assert!(!cron_matches("0 9-17 * * *", &dt(2026, 4, 21, 18, 0)));
+    }
+
+    #[test]
+    fn cron_matches_list() {
+        assert!(cron_matches("0,15,30,45 * * * *", &dt(2026, 4, 21, 10, 15)));
+        assert!(cron_matches("0,15,30,45 * * * *", &dt(2026, 4, 21, 10, 45)));
+        assert!(!cron_matches("0,15,30,45 * * * *", &dt(2026, 4, 21, 10, 20)));
+    }
+
+    #[test]
+    fn cron_matches_sunday_alias_7_equals_0() {
+        // 2026-04-19 is a Sunday. DoW=0 and DoW=7 both mean Sunday.
+        let sunday = dt(2026, 4, 19, 10, 0);
+        assert!(cron_matches("0 10 * * 0", &sunday));
+        assert!(cron_matches("0 10 * * 7", &sunday));
+    }
+
+    #[test]
+    fn cron_matches_wrong_field_count_is_false() {
+        assert!(!cron_matches("* * * *", &dt(2026, 4, 21, 10, 0)));
+    }
 }

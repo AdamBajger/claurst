@@ -1,334 +1,377 @@
-# Kairos Mode — Comprehensive Guide
+# Kairos Mode — Developer Architecture Overview
 
-## What is Kairos?
-
-Kairos is an **experimental/advanced mode** in Claurst that enables:
-- **Proactive communication** via the `Brief` tool
-- **Scheduled tasks** via `CronCreate`, `CronDelete`, `CronList` tools
-- **Channel-based messaging** (planned, not implemented)
+A guide for developers extending or debugging Kairos. For the implementation
+roadmap and phase log, see `KAIROS_FUTURE.md`.
 
 ---
 
-## Current Implementation Status
+## 1. What Kairos Is (One Paragraph)
 
-### ✅ Implemented
-| Component | Status | Location |
-|-----------|--------|----------|
-| `Brief` tool | Fully implemented | `crates/tools/src/brief.rs` |
-| `CronCreate` tool | Fully implemented | `crates/tools/src/cron.rs` |
-| `CronDelete` tool | Fully implemented | `crates/tools/src/cron.rs` |
-| `CronList` tool | Fully implemented | `crates/tools/src/cron.rs` |
-| Cron scheduler (background) | Fully implemented | `crates/query/src/cron_scheduler.rs` |
-| Feature flags (`kairos_brief`, `kairos_channels`) | Defined | `crates/core/Cargo.toml` |
-
-### ❌ Missing / Not Implemented
-| Component | Status | Notes |
-|-----------|--------|-------|
-| `kairos_brief` feature gate enforcement | **NOT ENFORCED** | Brief tool is always available regardless of feature flag |
-| `kairos_channels` feature | **EMPTY** | Flag exists but no implementation |
-| TUI integration for Kairos | **MISSING** | No special UI rendering for Kairos mode |
-| Environment variable detection (`KAIROS`, `KAIROS_BRIEF`) | **MISSING** | No runtime feature detection |
-| GrowthBook/feature gate integration | **MISSING** | No external feature flag system |
-| `/brief` command (CLI toggle) | **MISSING** | Spec mentions but not implemented |
-| `assistant` command | **MISSING** | Spec mentions but not implemented |
-| `subscribe-pr` command (GitHub webhooks) | **MISSING** | Spec mentions but not implemented |
-| `proactive` command | **MISSING** | Spec mentions but not implemented |
+Kairos is an experimental *assistant mode* that turns Claurst from a strictly
+reactive chat tool into one that can also (a) push notifications to the user on
+its own initiative (`Brief`), (b) run scheduled prompts (`CronCreate`), (c)
+execute slash commands asynchronously without blocking the TUI (`/btw`), (d)
+tick autonomously on a timer (proactive mode), and (e) resume the last session
+automatically when the user re-opens Claurst in the same working directory
+(session bridge). Every one of these features sits behind the same gate and
+funnels through the same background runner.
 
 ---
 
-## Build Configuration
+## 2. Architectural Layers (Responsibility Breakdown)
 
-### Feature Flags Defined
-```toml
-# crates/core/Cargo.toml
-[kairos_brief]  # Enables Brief tool (but not enforced)
-[kairos_channels]  # Planned, no implementation
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ TUI loop (crates/cli/src/main.rs)                                       │
+│   • startup initialization, bootstrap, cron+ticker spawn, drain loop    │
+│   • bridge pointer upsert, cron/proactive cancel on exit                │
+└────────────────┬──────────────────────────────────────┬─────────────────┘
+                 │                                      │
+                 │ bg_task_tx (AgentRunResult)          │ command_queue
+                 ▼                                      ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Background runner (crates/query/src/background_runner.rs)               │
+│   execute_agent_run(request, context) → bool(is_error)                  │
+│   │ ┌ runs query loop, records to task_history                          │
+│   │ └ sends AgentRunResult to result_tx when present                    │
+└─▲────────────────────▲──────────────────────▲─────────────┬─────────────┘
+  │                    │                      │             │
+  │ Cron               │ Proactive            │ /btw        │ records
+  │ scheduler          │ ticker               │ helper      │
+  │ (cron_scheduler)   │ (proactive_ticker)   │ (main.rs)   │
+  │                    │                      │             ▼
+  │                    │                      │   ┌─────────────────────┐
+  │                    │                      │   │ task_history (core) │
+  │                    │                      │   │   ring buffer 100   │
+  │                    │                      │   │   JSONL append      │
+  │                    │                      │   └─────────────────────┘
+  │                    │                      │
+┌─┴────────────────────┴──────────────────────┴───────────────────────────┐
+│ Kairos gate (crates/core/src/kairos_gate.rs)                            │
+│   resolve_runtime_state → KairosRuntimeState + Diagnostics              │
+│   is_kairos_brief_active / channels / proactive                         │
+│   proactive_interval_secs, proactive_tick_max_usd, prompts              │
+└─▲───────────────────────────────────────────────────────────────────────┘
+  │                                                                        
+┌─┴───────────────────────┐   ┌────────────────────────────────────────┐
+│ Feature flag compile    │   │ Session bridge (core/session_bridge.rs)│
+│ gate (core/tools/tui    │   │   BridgePointer, TTL, upsert/find/clean│
+│ /cli Cargo.toml)        │   └────────────────────────────────────────┘
+└─────────────────────────┘
 ```
 
-### Dependency Chain
-```
-claurst-tui
-  └── kairos_brief → claurst-core/kairos_brief
-  └── kairos_channels → claurst-core/kairos_channels
-
-claurst-tools
-  └── Always includes BriefTool, Cron*Tool (no feature gating)
-```
+Roughly: each layer below only knows about the layers below it. The gate has
+no knowledge of the TUI; the runner has no knowledge of cron vs. proactive vs.
+`/btw` beyond an `AgentRunSource` enum.
 
 ---
 
-## The Problem: `--all-features` is NOT Enough
+## 3. Key Structs and Where They Live
 
-Building with `cargo build --all-features` **does compile** the code, but:
-
-1. **No runtime activation**: There's no code path that checks `cfg!(feature = "kairos_brief")` to conditionally enable/disable functionality
-2. **Tools always registered**: `BriefTool` and `Cron*Tool` are registered in `crates/tools/src/lib.rs` unconditionally
-3. **No CLI commands**: No `/brief`, `/kairos`, or similar commands exist in the TUI
-4. **No environment hooks**: No `std::env::var("KAIROS")` checks anywhere
-
-**Result**: Kairos features are **always on** once compiled, regardless of build flags or environment variables.
+| Struct / enum | Crate::module | What it does |
+|---|---|---|
+| `KairosRuntimeState` | `core::kairos_gate` | Frozen snapshot of brief/channels/proactive flags + entitlement + diagnostics. Set once at startup. |
+| `KairosGateDiagnostics` | `core::kairos_gate` | Every input that fed the gate decision (compile flag, env vars, trust, bypass, entitlement). Rendered by `/kairos`. |
+| `BridgePointer` | `core::session_bridge` | `{session_id, working_dir, started_at, last_active_at}` — file at `~/.claurst/bridge/{session_id}.json`. |
+| `TaskRunRecord` / `RunStatus` | `core::task_history` | One record per background run. Stored in ring buffer + appended to JSONL. |
+| `AgentRunRequest` | `query::background_runner` | `{run_id, source, prompt}` — input to the runner. |
+| `AgentRunContext` | `query::background_runner` | Shared deps: `query_config`, `tool_ctx`, `client`, `tools`, `result_tx`. |
+| `AgentRunResult` | `query::background_runner` | `{run_id, source, output, is_error}` — flows to TUI via `bg_task_tx`. |
+| `AgentRunSource` | `query::background_runner` | `SlashCommand{name} | Cron{task_id} | Proactive`. Label-only; runner treats all sources identically. |
+| `QueryConfig` (`.kairos_enabled`) | `query::lib` | Carries Kairos system-prompt addendum + concise-mode flag into each turn. |
+| `CommandExecutionPolicy` | `commands::lib` | `BackgroundSafe | ForegroundOnly` — per-slash-command flag consulted by the TUI loop. |
+| `CronTask` + on-disk store | `tools::cron` | Serde struct for scheduled prompts; persisted to `~/.claurst/cron.json` when `durable=true`. |
 
 ---
 
-## How to Enable & Use (Current State)
+## 4. Guardrails — Where Each One Takes Effect
 
-### Step 1: Build
+| Guardrail | Fires at | Reference |
+|---|---|---|
+| Compile-time feature gate | Linker. If `kairos_brief` feature off, tools and gate calls fall back to `false`. | Cargo.toml chain (`cli → tui → tools → core`) |
+| Env-var activation | `resolve_runtime_state` on process start. | `core::kairos_gate::resolve_runtime_state` |
+| Onboarding trust check | Same. Skipped only when `KAIROS_TRUST_BYPASS=1`. | `core::kairos_gate::resolve_runtime_state` |
+| GrowthBook entitlement | Same. Can be forced open (`KAIROS_FORCE=1`) or required hard (`KAIROS_REQUIRE_ENTITLEMENT=1`). | `core::kairos_gate::check_entitlement` |
+| Tool exposure gate | Each model turn. Tools list excludes `Brief`/`Cron*` unless `kairos_brief_tools_enabled()` returns true. | `tools::lib::all_tools` |
+| Cron job cap | `CronCreate` tool execution. | `tools::cron::max_cron_jobs` (env `KAIROS_MAX_CRON_JOBS`, default 50, clamp [1,1000]) |
+| Proactive backoff | After 3 consecutive errored ticks, sleep interval doubles until a successful tick resets the counter. | `query::proactive_ticker` (`MAX_CONSECUTIVE_ERRORS=3`) |
+| Proactive per-tick cost ceiling | After 2 consecutive ticks whose `cost_tracker` delta exceeds `KAIROS_TICK_MAX_USD`, the ticker logs and exits. | `query::proactive_ticker` (`MAX_COST_OVERRUNS=2`) |
+| Bridge pointer TTL | On startup scan (`find_active_pointer`) and cleanup. Pointers older than `KAIROS_BRIDGE_TTL_SECS` (default 4h, min 60s) are deleted. | `core::session_bridge` |
+| Bridge write debounce | TUI drain loop, after each `save_session`. At most one disk write per 30s. | `crates/cli/src/main.rs:3020` |
+| MCP settlement wait | Before `/btw` background execution. 5s poll so tools resolve before a fresh query starts. | `crates/cli/src/main.rs` (`spawn_background_slash_command`) |
+
+---
+
+## 5. Startup Sequence (Entry Points)
+
+All line numbers reference `crates/cli/src/main.rs` at the time of writing.
+
+```
+main()
+├─ named-command path (headless)
+│   └─ line 484: initialize_runtime_state(has_completed_onboarding).await
+│                → sets RUNTIME_STATE, returns KairosRuntimeState
+│
+└─ run_interactive()
+    ├─ line 631: initialize_runtime_state(...).await           ← gate resolved here
+    ├─ line 820: apply_kairos_bootstrap_to_query_config(...)   ← mutates base QueryConfig
+    ├─ line 1642: bg_task_tx/rx created (unbounded mpsc)
+    ├─ line 1650–1662: cron_cancel token + start_cron_scheduler(..., Some(bg_task_tx))
+    ├─ line 1664–1674: proactive_cancel token + start_proactive_ticker(...) if proactive active
+    ├─ line 1850–1860: /btw & other BackgroundSafe slash commands routed to spawn_background_slash_command
+    ├─ line 2249: apply_kairos_bootstrap_to_query_config re-applied per turn (new qcfg)
+    ├─ line 2968–2986: drain loop — bg_task_rx.try_recv() → command_queue + notification + push_message
+    ├─ line 3018–3029: bridge pointer debounced upsert (30s) after each save_session
+    └─ line 3089–3090: proactive_cancel.cancel(); cron_cancel.cancel() on exit
+```
+
+**Bootstrap means:** two things. (1) Set `QueryConfig.kairos_enabled = true`.
+(2) Append `assistant_system_prompt_addendum(proactive_enabled)` to the system
+prompt so the model knows it is in Kairos mode. See
+`crates/query/src/lib.rs::apply_kairos_bootstrap_to_query_config`.
+
+---
+
+## 6. TUI Integration
+
+```
+User action          TUI behaviour                    Kairos mechanism
+─────────────────────────────────────────────────────────────────────────
+/btw <prompt>        Immediate toast:                 spawn_background_slash_command
+                     "Queued /btw in background."       → wait_for_mcp_settlement
+                     Conversation NOT blocked.          → execute_agent_run(SlashCommand)
+                                                        → AgentRunResult → bg_task_tx
+
+Cron tick fires      Toast on arrival:                cron_scheduler (tokio task)
+(minute granularity)  "Background cron:<id> finished."   → pop_due_tasks
+                     System message injected into       → execute_agent_run(Cron{id})
+                     conversation via command_queue.    → AgentRunResult → bg_task_tx
+
+Proactive tick       Toast + system message.           proactive_ticker
+                     Label reads "kairos".              → execute_agent_run(Proactive)
+                                                        → AgentRunResult → bg_task_tx
+
+Model calls Brief    Toast + message. Model decides   BriefTool (permission_level=None)
+                     wording.                           → pushes ToolResult the TUI renders
+
+/kairos [N]          Rendered gate state,             KairosCommand (foreground, synchronous)
+                     diagnostics, cron list, last N     → reads runtime_state, list_tasks,
+                     run records.                         last_runs[_by_cron_id]
+```
+
+**Drain loop pattern** (`crates/cli/src/main.rs:2968`): every frame, the loop
+drains `bg_task_rx` non-blocking and for each `AgentRunResult` does three
+things in order:
+1. push `QueuedCommand::InjectSystemMessage(meta)` into `command_queue` so the
+   model sees the background output on its next turn;
+2. push a toast into `app.notifications`;
+3. append the meta string into `app.messages` so it appears in the scrollback.
+
+This is the *only* path background output takes into the TUI. Anything new
+that wants to surface a result should go through `AgentRunResult`.
+
+---
+
+## 7. Feature → UX Mapping
+
+### 7.1 Brief (`BriefTool`)
+- **Who triggers it:** the model, unprompted.
+- **What the user sees:** a tool-result block in the current transcript with
+  the model's `message` and optional `attachments`, plus no additional
+  approval prompt (permission level `None`).
+- **Code:** `crates/tools/src/brief.rs`.
+
+### 7.2 Cron (`CronCreate`, `CronDelete`, `CronList`)
+- **Triggers:** model calls a tool; user has no direct slash command for
+  create/delete (by design — they go through the model turn).
+- **What the user sees:** tool result confirming the task ID; later, when the
+  task fires, a toast `"Background cron:<id> finished."` plus a system
+  message injected into the conversation. `/kairos` lists active tasks with
+  their last run timestamp and status.
+- **Persistence:** `durable=true` writes to `~/.claurst/cron.json`; reload on
+  startup.
+- **Code:** `crates/tools/src/cron.rs`, `crates/query/src/cron_scheduler.rs`.
+
+### 7.3 Background slash commands (`/btw`, etc.)
+- **Trigger:** user types a slash command whose `execution_policy()` returns
+  `BackgroundSafe`.
+- **What the user sees:** immediate toast, TUI free to accept new input, later
+  toast + system message when complete.
+- **Code:** `crates/cli/src/main.rs::spawn_background_slash_command`,
+  `crates/commands/src/lib.rs` (policy definition).
+
+### 7.4 Proactive mode (`KAIROS_PROACTIVE=1`)
+- **Trigger:** timer in the ticker (every `KAIROS_PROACTIVE_INTERVAL_SECS`).
+- **Prompt sent to model:** `proactive_tick_prompt()` (defined in
+  `kairos_gate.rs` — this is the *only* prompt text and it is static).
+- **What the user sees:** same pattern as cron — toast + injected system
+  message, label `kairos`.
+- **Guardrails visible to user:** if repeated failures double the interval, a
+  single warn! log appears. If `KAIROS_TICK_MAX_USD` overruns twice, the
+  ticker exits silently to the log; no new Kairos ticks until restart.
+
+### 7.5 Session bridge (auto-resume)
+- **Trigger:** startup with no explicit `--resume` flag.
+- **What the user sees:** the last active session for the current working
+  directory is loaded automatically. Explicit `--resume` wins over
+  auto-discovered pointer (`cli.resume.or(bridge_resume_id)`).
+- **Code:** `crates/core/src/session_bridge.rs`, invoked in `run_interactive`.
+
+### 7.6 `/kairos` status
+- **Trigger:** user slash command.
+- **What the user sees:** multi-line status block with:
+  - Gate flags (brief/channels/proactive/entitled)
+  - Frozen diagnostics (compile flags, env vars, trust/bypass, entitlement)
+  - Cron jobs with last_run per task
+  - Last N run records (default 10, clamp [1, 100] via `/kairos <N>`)
+- **Code:** `crates/commands/src/lib.rs::KairosCommand`.
+
+---
+
+## 8. System Prompts — Where They Live
+
+There are exactly two prompt strings under Kairos control, both in
+`crates/core/src/kairos_gate.rs`:
+
+| Function | Purpose |
+|---|---|
+| `assistant_system_prompt_addendum(proactive_enabled: bool)` | Appended to the base system prompt by `apply_kairos_bootstrap_to_query_config`. Tells the model Kairos is on, to be terse, to use `Brief` for notifications, and (when proactive) to pace autonomous work. |
+| `proactive_tick_prompt()` | User-turn message sent on each proactive tick. Static. |
+
+That's it. Brief, cron, and background slash output are delivered to the
+model as plain system/user messages (see drain loop); they do not introduce
+new prompt templates.
+
+---
+
+## 9. Configuration — ENV Only (Design Choice)
+
+Kairos deliberately does **not** use `settings.json`. Rationale: gate state
+must be resolvable at the earliest possible startup point (before settings
+loading completes in some code paths) and must be auditable from the shell
+that launched the binary. Treat this as intentional — if you add a knob,
+add it as an env var and document it below. Settings.json integration is
+out of scope until a concrete need arises.
+
+Priority: ENV > compile-time feature flag. If the feature is not compiled,
+env vars do nothing.
+
+| Env var | Default | Range / effect | Read at |
+|---|---|---|---|
+| `KAIROS` | unset | Umbrella opt-in. Enables brief + channels + proactive. | `resolve_runtime_state` |
+| `KAIROS_BRIEF` | unset | Brief-only opt-in (also set by `KAIROS`). | same |
+| `KAIROS_CHANNELS` | unset | Channels opt-in. No implementation yet. | same |
+| `KAIROS_PROACTIVE` | unset | Proactive loop opt-in. Requires brief also active. | same |
+| `KAIROS_TRUST_BYPASS` | unset | Skip onboarding-trust requirement. | same |
+| `KAIROS_FORCE` | unset | Bypass GrowthBook entitlement check. | same |
+| `KAIROS_REQUIRE_ENTITLEMENT` | unset | Fail closed if entitlement fetch fails or flag is off. | same |
+| `KAIROS_PROACTIVE_INTERVAL_SECS` | 900 | Clamped to [60, 3600]. Tick period. | `proactive_interval_secs` |
+| `KAIROS_TICK_MAX_USD` | unset | Per-tick cost ceiling. `None` if unset / invalid / non-positive (no ceiling). Two consecutive overruns stop the ticker. | `proactive_tick_max_usd` |
+| `KAIROS_MAX_CRON_JOBS` | 50 | Clamped to [1, 1000]. | `tools::cron::max_cron_jobs` |
+| `KAIROS_BRIDGE_TTL_SECS` | 14400 (4h) | Min 60s. Pointers older than this are stale. | `core::session_bridge::bridge_ttl_secs` |
+
+`is_env_truthy` accepts `1`, `true`, `yes`, `on` (case-insensitive).
+
+---
+
+## 10. Minimum Activation Recipe
+
 ```bash
-cd src-rust
-cargo build --all-features
-# OR explicitly:
-cargo build --features "kairos_brief,kairos_channels"
+# Build with feature + local-dev bypasses (no remote entitlement):
+KAIROS=1 KAIROS_TRUST_BYPASS=1 \
+  cargo run --features kairos_brief
+
+# Enable proactive as well:
+KAIROS=1 KAIROS_TRUST_BYPASS=1 KAIROS_PROACTIVE=1 \
+KAIROS_PROACTIVE_INTERVAL_SECS=60 KAIROS_TICK_MAX_USD=0.10 \
+  cargo run --features kairos_brief
 ```
 
-### Step 2: Run
+Verify in the running TUI:
+
+```
+/kairos
+```
+
+---
+
+## 11. Extension Points — Where to Hook New Work
+
+| You want to add… | Extend here |
+|---|---|
+| A new autonomous driver (new kind of background task) | New caller of `execute_agent_run`, add a variant to `AgentRunSource`. |
+| A new Kairos-only tool | Add the struct in `crates/tools/src/`, register it inside the `if kairos_brief_tools_enabled()` block in `tools::lib::all_tools`. |
+| A new background-safe slash command | Override `execution_policy()` in `crates/commands/src/lib.rs` to return `BackgroundSafe`. |
+| A new gate input | Extend `KairosGateDiagnostics` and the logic in `resolve_runtime_state`. Update `format_summary`. |
+| A new persisted Kairos artifact | Prefer `~/.claurst/...` and write a round-trip test next to the serde struct (see `session_bridge.rs` tests as template). |
+| New recorded metrics on a background run | Extend `TaskRunRecord` in `core::task_history`; `execute_agent_run` is the single write site. |
+| A new env knob | Add parser in `core::kairos_gate` (or `session_bridge`/`cron` for domain-specific knobs). Document in §9 above. |
+
+Two rules that have proven load-bearing:
+
+1. **One runner path.** Everything background must go through
+   `execute_agent_run`. Do not spawn a second parallel query path — you will
+   miss `task_history` recording, `AgentRunResult` plumbing, and Kairos
+   bootstrap.
+2. **Gate first, then act.** Any new feature must consult
+   `is_kairos_*_active()` at the top of its spawn site, like cron and
+   proactive already do. No feature turns itself on unilaterally.
+
+---
+
+## 12. Testing Procedures
+
+### T1 — Gate activation
 ```bash
-./target/debug/claurst
-# or
-./target/release/claurst
+KAIROS=1 KAIROS_TRUST_BYPASS=1 cargo run --features kairos_brief
 ```
+Run `/kairos` — `brief_enabled` should be `true`, diagnostics should show
+`env KAIROS=yes trust_bypass=yes`.
 
-### Step 3: Use Available Tools
-Once running, these tools are **always available**:
+### T2 — Brief
+Ask the model to call `Brief` with a short message. Expect a tool-result
+block in the current turn; no additional approval prompt.
 
-#### Brief Tool
-```rust
-// Called by the model to notify the user
-Brief {
-    message: "Task complete",
-    status: "proactive",  // or "normal"
-    attachments: ["file.txt"]  // optional
-}
+### T3 — Recurring cron
+Ask the model to `CronCreate { cron: "* * * * *", prompt: "say hi",
+recurring: true, durable: false }`. Within ≤60s: toast + injected system
+message labelled `cron:<id>`.
+
+### T4 — Durable persistence
+Same but with `durable: true`. Exit Claurst, re-enter, run `/kairos`. Task
+still listed.
+
+### T5 — BackgroundSafe slash
+`/btw what time is it` — immediate "Queued" toast, then a completion toast
+and injected message later.
+
+### T6 — Proactive cost guardrail
 ```
-
-#### Cron Tools
-```rust
-// Schedule a recurring task
-CronCreate {
-    cron: "*/5 * * * *",
-    prompt: "Check for new emails",
-    recurring: true,
-    durable: true  // persists across sessions
-}
-
-// List scheduled tasks
-CronList {}
-
-// Delete a task
-CronDelete { id: "abc123" }
+KAIROS=1 KAIROS_TRUST_BYPASS=1 KAIROS_PROACTIVE=1 \
+KAIROS_PROACTIVE_INTERVAL_SECS=60 KAIROS_TICK_MAX_USD=0.0001 \
+cargo run --features kairos_brief
 ```
+After two ticks the ticker exits; grep logs for `"repeated cost overruns,
+stopping"`.
 
----
+### T7 — Bridge auto-resume
+Start Claurst in directory X, send one message, exit. Re-enter from X with
+no `--resume` flag — prior session loads.
 
-## Cron Expression Format
-
-```
-M H DoM Mon DoW  (5 fields, local time)
-
-Examples:
-*/5 * * * *     → Every 5 minutes
-30 14 * * 1     → Every Monday at 14:30
-0 9 15 * *      → 15th of each month at 09:00
-* * * * *       → Every minute
-```
-
----
-
-## Known Issues & Design Flaws
-
-### 1. Feature Flags Are Decorative
-**Problem**: `kairos_brief` and `kairos_channels` flags have no effect on runtime behavior.
-
-**Location**: `crates/tools/src/lib.rs` lines 61, 385-387
-
-```rust
-// Unconditional registration - feature flag ignored
-pub use brief::BriefTool;
-// ...
-Box::new(BriefTool),
-Box::new(CronCreateTool),
-Box::new(CronDeleteTool),
-Box::new(CronListTool),
-```
-
-**Fix needed**: Wrap registration in `#[cfg(feature = "kairos_brief")]`.
-
-### 2. No Channel Implementation
-**Problem**: `kairos_channels` feature flag exists but zero code references it.
-
-**Impact**: Flag is useless; no channels, subscriptions, or multi-channel routing exist.
-
-### 3. Cron Scheduler Lifecycle Not Exposed
-**Problem**: Cron scheduler starts in `main.rs` but there's no way to view/manage it from within the session.
-
-**Current flow**:
-```rust
-// main.rs lines 730-738
-let cron_cancel = CancellationToken::new();
-start_cron_scheduler(&query_state, cron_cancel.clone());
-```
-
-**Missing**: Commands to pause/resume/reload cron scheduler at runtime.
-
-### 4. Persistent Storage Race Condition
-**Problem**: `ensure_store_loaded()` uses a mutex but `CRON_STORE` is a separate `Lazy` static.
-
-**Risk**: If `CronList` runs before the scheduler loads disk state, it may miss durable tasks.
-
-**Current mitigation**: Each tool calls `ensure_store_loaded()` before accessing the store.
-
-### 5. No Task Output Visibility
-**Problem**: Cron tasks fire in the background but their output is logged only (no UI display).
-
-**Location**: `cron_scheduler.rs` lines 94-113
-
-```rust
-// Output goes to logs, not user-visible
-info!(id = %task_id, "Cron task completed");
-```
-
-**Missing**: A way to view cron task results/history in the TUI.
-
-### 6. Hard-Coded Limits
-**Problem**: Max 50 jobs hardcoded in `CronCreate`.
-
-**Location**: `cron.rs` line 319
-
-```rust
-if store.len() >= 50 {
-    return ToolResult::error("Too many scheduled jobs (max 50).");
-}
-```
-
-**Fix**: Make configurable via `.claurst/config.json`.
-
----
-
-## Testing Procedures
-
-### Test 1: Basic Brief
+### T8 — Unit suites
 ```bash
-# In an active session
-# Model should be able to call:
-Brief { message: "Test", status: "normal" }
-```
-
-### Test 2: Recurring Cron
-```bash
-# Schedule every minute
-CronCreate { cron: "* * * * *", prompt: "echo hello", recurring: true, durable: false }
-# Wait 60 seconds — should see log output
-```
-
-### Test 3: Durable Persistence
-```bash
-# Create durable task
-CronCreate { cron: "*/5 * * * *", prompt: "check status", durable: true }
-# Exit claurst
-# Restart claurst
-CronList  # Task should still appear
-```
-
-### Test 4: One-Shot Task
-```bash
-CronCreate { cron: "* * * * *", prompt: "run once", recurring: false }
-# Wait for next minute — fires once then auto-deletes
-CronList  # Task should be gone
+cargo test -p claurst-core  --features kairos_brief --lib
+cargo test -p claurst-tools --features kairos_brief --lib cron
 ```
 
 ---
 
-## Steps to Fully Enable Kairos Mode
+## 13. Known Gaps (Snapshot)
 
-### Option A: Enforce Feature Gates (Recommended)
-1. Modify `crates/tools/src/lib.rs`:
-   ```rust
-   #[cfg(feature = "kairos_brief")]
-   pub use brief::BriefTool;
+- `kairos_channels` feature flag exists but has no implementation.
+- No slash command to pause/resume individual cron jobs or the whole scheduler (delete-only).
+- No transcript segmentation + lazy history load for long sessions.
+- No integration-test harness exercising restart+resume or parallel background fan-out.
+- Prompt dedupe across ticks is not implemented (prompt is static — not meaningful yet).
 
-   #[cfg(feature = "kairos_brief")]
-   Box::new(BriefTool),
-   ```
-
-2. Add runtime check in TUI initialization:
-   ```rust
-   if cfg!(feature = "kairos_brief") {
-       // Register Kairos-specific commands
-   }
-   ```
-
-3. Add environment variable override:
-   ```rust
-   let kairos_enabled = cfg!(feature = "kairos_brief")
-       || std::env::var("KAIROS").is_ok();
-   ```
-
-### Option B: Remove Feature Gates (Simpler)
-Since `--all-features` already compiles everything:
-1. Delete `kairos_brief` and `kairos_channels` from `Cargo.toml`
-2. Document that Brief/Cron tools are always available
-3. Focus on implementing missing pieces (commands, channels)
-
-### Option C: Implement Full Kairos (Complete)
-1. Enforce feature gates (Option A)
-2. Implement `/brief` command to toggle brief-only mode
-3. Implement `assistant` command for agent communication
-4. Implement `subscribe-pr` for GitHub webhooks
-5. Implement channel routing for `kairos_channels`
-6. Add GrowthBook integration for remote feature flags
-
----
-
-## File Reference Map
-
-| File | Purpose |
-|------|---------|
-| `crates/core/Cargo.toml` | Feature flag definitions |
-| `crates/tui/Cargo.toml` | Feature pass-through |
-| `crates/tools/src/brief.rs` | BriefTool implementation |
-| `crates/tools/src/cron.rs` | CronCreate/Delete/List tools |
-| `crates/tools/src/lib.rs` | Tool registration |
-| `crates/query/src/cron_scheduler.rs` | Background scheduler |
-| `crates/cli/src/main.rs` | Scheduler startup (lines 730-738) |
-
----
-
-## Summary
-
-| Aspect | Status |
-|--------|--------|
-| **Build** | Works with `--all-features` |
-| **Runtime activation** | Always on (no gating) |
-| **Core tools** | Fully functional |
-| **Commands/UI** | Missing |
-| **Channels** | Not implemented |
-| **Production ready** | No (experimental only) |
-
-**Bottom line**: Kairos mode compiles and works, but the feature flags don't actually gate anything. The tools are always available once built. To make them truly optional, add `#[cfg(feature = "...")]` guards around tool registration.
-
----
-
-## Progress Addendum (feature/kairos-mode)
-
-This document started as a baseline snapshot. The items below track code changes applied after that snapshot.
-
-### 2026-04-16 — Applied Changes
-
-### 2026-04-16 — Unified cron/agent background execution substrate
-
-- Refactored the cron scheduler to use the same background runner as slash commands (`spawn_background_agent_task`).
-- Exposed a new function in CLI for background agent/cron tasks, reusing the slash command substrate.
-- All background agent/cron execution now flows through a single substrate, simplifying future agent management and session/report tracking.
-
-- Introduced strict runtime Kairos gating and initialization in `src-rust/crates/core/src/kairos_gate.rs`.
-- Wired startup initialization order in `src-rust/crates/cli/src/main.rs` (both normal and named-command paths).
-- Gated Kairos tool exposure in `src-rust/crates/tools/src/lib.rs`.
-- Added assistant bootstrap behavior and query-config propagation in `src-rust/crates/cli/src/main.rs` and `src-rust/crates/query/src/lib.rs`.
-- Added async background command path for `/btw`, including MCP settlement wait and completion requeue.
-- Added command execution policy metadata in `src-rust/crates/commands/src/lib.rs`.
-- Replaced hardcoded `/btw` route with policy-based background routing in `src-rust/crates/cli/src/main.rs`.
-- Extracted reusable helper `spawn_background_slash_command(...)` in `src-rust/crates/cli/src/main.rs` as shared background-runner foundation.
-
-### Validation
-
-- `cargo check -p claurst` passed.
-- `cargo check -p claurst --features kairos_brief` passed.
+See `KAIROS_FUTURE.md` for the prioritized backlog and phase log.

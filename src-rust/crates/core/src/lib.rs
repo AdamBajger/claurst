@@ -65,6 +65,10 @@ pub use ide::{IdeKind, detect_ide};
 pub mod update_check;
 pub use update_check::{check_for_updates, UpdateInfo};
 
+// Kairos session bridge: pointer files for session continuity across restarts.
+pub mod session_bridge;
+pub use session_bridge::{BridgePointer, cleanup_stale_pointers, find_active_pointer, upsert_bridge_pointer};
+
 // Re-export commonly used types at the crate root
 pub use error::{ClaudeError, Result};
 pub use types::{
@@ -3446,6 +3450,7 @@ pub mod effort;
 pub mod prompt_history;
 pub mod bash_classifier;
 pub mod ps_classifier;
+pub mod task_history;
 
 // ---------------------------------------------------------------------------
 // tasks module — background task registry

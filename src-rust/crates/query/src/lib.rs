@@ -1,3 +1,64 @@
+/// Overlay an `AgentConfig` onto a `QueryConfig` at spawn time.
+///
+/// Round 2 transitional bridge: `QueryConfig` remains the carrier consumed by
+/// `run_query_loop`; spawn sites resolve a per-spawn `AgentConfig` (typically via
+/// `LiveSession::resolve_agent_config`) and apply it via this function. Fields
+/// on `AgentConfig` set to `Some(_)` / `true` win over the base; `None` /
+/// `false` leaves the base value in place.
+///
+/// Notes:
+/// - `agent_definition` field is also set so existing code paths that read
+///   `config.agent_definition.append_system_prompt` continue working.
+/// - Effort string is parsed lazily; unparseable values are ignored.
+/// - `tools` / `mcp` / `permission_defaults` are not yet applied here — those
+///   land in Phase 9 / 9.5 wiring.
+pub fn apply_agent_config_to_query_config(
+    agent: &claurst_core::AgentConfig,
+    qcfg: &mut QueryConfig,
+) {
+    if let Some(model) = agent.model.as_ref() {
+        qcfg.model = model.clone();
+    }
+    if let Some(max_tokens) = agent.max_tokens {
+        qcfg.max_tokens = max_tokens;
+    }
+    if let Some(max_turns) = agent.max_turns {
+        qcfg.max_turns = max_turns;
+    }
+    if let Some(temp) = agent.temperature {
+        qcfg.temperature = Some(temp as f32);
+    }
+    if let Some(thinking) = agent.thinking_budget {
+        qcfg.thinking_budget = Some(thinking);
+    }
+    if let Some(budget) = agent.tool_result_budget {
+        qcfg.tool_result_budget = budget;
+    }
+    if let Some(fallback) = agent.fallback_model.as_ref() {
+        qcfg.fallback_model = Some(fallback.clone());
+    }
+    if let Some(style) = agent.output_style {
+        qcfg.output_style = style;
+    }
+    if let Some(effort) = agent.effort.as_deref() {
+        if let Some(level) = claurst_core::effort::EffortLevel::from_str(effort) {
+            qcfg.effort_level = Some(level);
+        }
+    }
+    if let Some(sys) = agent.system_prompt.as_ref() {
+        qcfg.system_prompt = Some(sys.clone());
+    }
+    if let Some(append) = agent.append_system_prompt.as_ref() {
+        qcfg.append_system_prompt = Some(match qcfg.append_system_prompt.as_ref() {
+            Some(existing) if !existing.trim().is_empty() => {
+                format!("{}\n\n{}", existing, append)
+            }
+            _ => append.clone(),
+        });
+    }
+    qcfg.agent_definition = Some(agent.clone());
+}
+
 pub fn apply_kairos_bootstrap_to_query_config(
     qcfg: &mut QueryConfig,
     kairos_state: &claurst_core::kairos_gate::KairosRuntimeState,
@@ -835,7 +896,7 @@ pub async fn run_query_loop(
 
             // Apply agent system-prompt prefix: prepend before the main system prompt.
             if let Some(ref agent) = config.agent_definition {
-                if let Some(ref agent_prompt) = agent.prompt {
+                if let Some(ref agent_prompt) = agent.append_system_prompt {
                     patched.system_prompt = Some(match &config.system_prompt {
                         Some(existing) => format!("{}\n\n{}", agent_prompt, existing),
                         None => agent_prompt.clone(),
@@ -2173,6 +2234,7 @@ mod tests {
             agent_definition: None,
             model_registry: None,
             managed_agents: None,
+            kairos_enabled: false,
         }
     }
 

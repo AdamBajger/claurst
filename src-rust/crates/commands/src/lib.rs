@@ -30,6 +30,10 @@ pub struct CommandContext {
     // Note: config already contains hooks, mcp_servers, etc.
     /// Live MCP manager — present when servers are connected.
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    /// Round 2 live session aggregate (settings + ephemeral overlay + runtime
+    /// handles). `None` for pre-session named-command fast-paths and other
+    /// contexts where the session has not been bootstrapped yet.
+    pub live_session: Option<claurst_core::live_session::SharedLiveSession>,
 }
 
 /// Result of running a slash command.
@@ -7643,7 +7647,7 @@ impl SlashCommand for AgentCommand {
             if let Some(ref color) = def.color {
                 output.push_str(&format!("Color: {}\n", color));
             }
-            if let Some(ref prompt) = def.prompt {
+            if let Some(ref prompt) = def.append_system_prompt {
                 output.push_str(&format!("\nSystem prompt prefix:\n  {}\n", prompt));
             }
             output.push_str(&format!(
@@ -8439,6 +8443,7 @@ mod tests {
             session_title: None,
             remote_session_url: None,
             mcp_manager: None,
+            live_session: None,
         }
     }
 

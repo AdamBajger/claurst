@@ -12,6 +12,8 @@ use crate::background_runner::{
     AgentRunContext, AgentRunRequest, AgentRunResult, AgentRunSource, spawn_agent_run,
 };
 use crate::QueryConfig;
+use claurst_core::AgentConfig;
+use claurst_core::live_session::SharedLiveSession;
 use claurst_tools::{Tool, ToolContext};
 use chrono::Timelike;
 use std::sync::Arc;
@@ -24,6 +26,11 @@ use tracing::{debug, info};
 /// Call `cancel.cancel()` to stop it gracefully.
 /// `result_tx` is forwarded to each fired task so its output reaches the TUI
 /// drain loop; pass `None` for headless contexts with no drain.
+///
+/// Phase 11: when `live_session` is `Some`, each fired task whose
+/// `CronTask.agent_name` is set resolves through
+/// `LiveSession::resolve_agent_config(name)`. With `None` (back-compat),
+/// every fire uses `AgentConfig::default()`.
 pub fn start_cron_scheduler(
     client: Arc<claurst_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn Tool>>>,
@@ -31,6 +38,7 @@ pub fn start_cron_scheduler(
     query_config: QueryConfig,
     result_tx: Option<mpsc::UnboundedSender<AgentRunResult>>,
     cancel: CancellationToken,
+    live_session: Option<SharedLiveSession>,
 ) {
     tokio::spawn(async move {
         info!("Cron scheduler started");
@@ -56,8 +64,17 @@ pub fn start_cron_scheduler(
             debug!(time = %tick_time.format("%H:%M"), "Cron scheduler tick");
 
             for task in claurst_tools::cron::pop_due_tasks(&tick_time).await {
-                info!(id = %task.id, cron = %task.cron, "Firing cron task");
+                info!(
+                    id = %task.id,
+                    cron = %task.cron,
+                    agent = ?task.agent_name,
+                    "Firing cron task",
+                );
                 let run_id = task.id.clone();
+                let agent_config = match (live_session.as_ref(), task.agent_name.as_deref()) {
+                    (Some(live), Some(name)) => live.resolve_agent_config(Some(name)),
+                    _ => AgentConfig::default(),
+                };
                 spawn_agent_run(
                     AgentRunRequest {
                         run_id,
@@ -66,10 +83,13 @@ pub fn start_cron_scheduler(
                     },
                     AgentRunContext {
                         query_config: query_config.clone(),
+                        agent_config,
                         tool_ctx: tool_ctx.clone(),
                         client: client.clone(),
                         tools: tools.clone(),
                         result_tx: result_tx.clone(),
+                        task_tracker: None,
+                        event_log: None,
                     },
                 );
             }

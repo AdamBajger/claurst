@@ -19,6 +19,7 @@ use claurst_tools::{Tool, ToolContext};
 
 use crate::background_runner::{AgentRunContext, AgentRunRequest, AgentRunResult, AgentRunSource, execute_agent_run};
 use crate::QueryConfig;
+use claurst_core::AgentConfig;
 
 const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 /// Number of consecutive per-tick cost overruns that shut the ticker down.
@@ -73,10 +74,20 @@ pub fn start_proactive_ticker(
                 },
                 AgentRunContext {
                     query_config: query_config.clone(),
+                    // Phase 8 baseline: proactive tick uses default agent config.
+                    // Phase 11 will resolve a named "kairos-proactive" agent via
+                    // LiveSession::resolve_agent_config so the user can customize
+                    // model / prompt / tools per-tick.
+                    agent_config: AgentConfig {
+                        kairos_addendum: true,
+                        ..Default::default()
+                    },
                     tool_ctx: tool_ctx.clone(),
                     client: client.clone(),
                     tools: tools.clone(),
                     result_tx: Some(result_tx.clone()),
+                    task_tracker: None,
+                    event_log: None,
                 },
             )
             .await;

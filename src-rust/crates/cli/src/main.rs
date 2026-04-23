@@ -376,6 +376,7 @@ fn spawn_background_slash_command(
         session_title: cmd_ctx.session_title.clone(),
         remote_session_url: cmd_ctx.remote_session_url.clone(),
         mcp_manager: cmd_ctx.mcp_manager.clone(),
+        live_session: cmd_ctx.live_session.clone(),
     };
 
     // query_config already has Kairos bootstrap applied from startup — do not re-apply.
@@ -399,10 +400,16 @@ fn spawn_background_slash_command(
             Some(claurst_commands::CommandResult::UserMessage(msg)) => {
                 let ctx = AgentRunContext {
                     query_config: bg_query_config,
+                    // Phase 8 baseline: slash-command-spawned bg runs use default
+                    // agent config. Future: route through LiveSession when bg
+                    // commands carry an explicit agent name.
+                    agent_config: claurst_core::AgentConfig::default(),
                     tool_ctx: bg_tool_ctx,
                     client,
                     tools,
                     result_tx: Some(result_tx),
+                    task_tracker: None,
+                    event_log: None,
                 };
                 execute_agent_run(AgentRunRequest { run_id, source, prompt: msg }, ctx).await;
             }
@@ -496,6 +503,8 @@ async fn main() -> anyhow::Result<()> {
                     session_title: None,
                     remote_session_url: None,
                     mcp_manager: None,
+                    // Pre-session named-command fast path: no live session yet.
+                    live_session: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -723,6 +732,41 @@ async fn main() -> anyhow::Result<()> {
     ));
     let current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+    // Round 2 LiveSession bootstrap (task #26). One LiveSession per CLI process,
+    // covering both interactive and headless paths. Carries:
+    //   - settings: persistent root (RwLock-cloned for slash-command writes).
+    //   - ephemeral: per-session overlay (scratch agents, MCP specs, overrides).
+    //   - runtime handles: cwd, active project, project registry, cost tracker,
+    //     PermissionManager (separate from PermissionHandler — manager owns
+    //     the rule store; handler is the UI prompt).
+    //
+    // Project registry loaded from `~/.claurst/projects/`; missing dir treated
+    // as empty registry (warn-level skip). Pre-session named-command fast path
+    // and ACP server path do not bootstrap one — see CommandContext.live_session.
+    let live_session: claurst_core::live_session::SharedLiveSession = {
+        let project_registry = dirs::home_dir()
+            .map(|h| h.join(".claurst").join("projects"))
+            .and_then(|dir| {
+                claurst_core::project_registry::ProjectRegistry::load_from_dir(&dir)
+                    .map_err(|e| {
+                        warn!(error = %e, "Project registry load failed; using empty registry");
+                    })
+                    .ok()
+            })
+            .unwrap_or_default();
+        let perm_manager = claurst_core::permissions::PermissionManager::new(
+            config.permission_mode.clone(),
+            &settings,
+        );
+        claurst_core::live_session::LiveSession::with_projects(
+            settings.clone(),
+            cwd.clone(),
+            cost_tracker.clone(),
+            perm_manager,
+            project_registry,
+        )
+    };
+
     // Initialize MCP servers first (needed for ToolContext.mcp_manager).
     let mcp_manager_arc = connect_mcp_manager_arc(&config).await;
 
@@ -891,6 +935,7 @@ async fn main() -> anyhow::Result<()> {
             bridge_config,
             has_credentials,
             model_registry,
+            live_session,
         )
         .await
     };
@@ -1376,6 +1421,7 @@ async fn run_interactive(
     bridge_config: Option<claurst_bridge::BridgeConfig>,
     has_credentials: bool,
     model_registry: Arc<claurst_api::ModelRegistry>,
+    live_session: claurst_core::live_session::SharedLiveSession,
 ) -> anyhow::Result<()> {
     use claurst_commands::{
         execute_command, find_command_execution_policy, CommandContext,
@@ -1628,6 +1674,7 @@ async fn run_interactive(
         session_title: session.title.clone(),
         remote_session_url: session.remote_session_url.clone(),
         mcp_manager: tool_ctx.mcp_manager.clone(),
+        live_session: Some(live_session.clone()),
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
@@ -1656,6 +1703,7 @@ async fn run_interactive(
             base_query_config.clone(),
             Some(bg_task_tx.clone()),
             cron_cancel.clone(),
+            Some(live_session.clone()),
         );
     } else {
         debug!("Kairos tools disabled; cron scheduler not started");

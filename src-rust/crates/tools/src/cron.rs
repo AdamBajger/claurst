@@ -40,6 +40,11 @@ pub struct CronTask {
     pub recurring: bool,
     pub durable: bool,
     pub created_at: u64,
+    /// Phase 11: optional named agent. When set, scheduler resolves
+    /// `LiveSession::resolve_agent_config(Some(name))` at fire time.
+    /// Legacy on-disk tasks load with `None` via `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
 }
 
 /// 7 days in seconds — tasks older than this are purged on load.
@@ -349,6 +354,7 @@ impl Tool for CronCreateTool {
             recurring: params.recurring,
             durable: params.durable,
             created_at: now,
+            agent_name: None,
         };
 
         store.insert(id.clone(), task);

@@ -75,7 +75,7 @@ pub use types::{
     ContentBlock, ImageSource, DocumentSource, CitationsConfig, Message, MessageContent,
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
-pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
+pub use config::{AgentConfig, AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
 
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
@@ -85,12 +85,12 @@ pub use history::ConversationSession;
 pub use feature_flags::FeatureFlagManager;
 pub use snapshot::SnapshotManager;
 pub use permissions::{
-    AutoPermissionHandler, InteractivePermissionHandler,
-    ManagedAutoPermissionHandler, ManagedInteractivePermissionHandler,
-    PermissionAction, PermissionDecision, PermissionHandler,
+    AutoPermissionHandler, CommandPattern, InputMatcher, InteractivePermissionHandler,
+    KairosPermissionPolicy, ManagedAutoPermissionHandler, ManagedInteractivePermissionHandler,
+    PathMode, PermissionAction, PermissionDecision, PermissionHandler,
     PermissionLevel, PermissionManager, PermissionRequest,
-    PermissionRule, PermissionScope, SerializedPermissionRule,
-    format_permission_reason,
+    PermissionRule, PermissionScope, PermissionSubject, SerializedPermissionRule,
+    Shell, TaskSource, UrlPattern, format_permission_reason,
 };
 
 // ---------------------------------------------------------------------------
@@ -578,6 +578,7 @@ pub mod config {
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use crate::system_prompt::OutputStyle;
 
     // ---- Hook configuration ----------------------------------------------
 
@@ -701,17 +702,48 @@ pub mod config {
         }
     }
 
+    /// Per-agent restriction over the runtime tool registry. Stub for Phase 8;
+    /// fleshed out in later phases (per-tool overrides, preset bundles).
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct ToolConfig {
+        /// Allowlist of tool names; `None` = all enabled.
+        #[serde(default)]
+        pub allowlist: Option<Vec<String>>,
+        /// Denylist of tool names (additive on top of any global denylist).
+        #[serde(default)]
+        pub denylist: Vec<String>,
+    }
+
+    /// Per-agent restriction over the unified MCP server registry. Stub for Phase 8.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct MCPConfig {
+        /// Names referencing entries in the unified runtime MCP registry.
+        /// Empty = all available.
+        #[serde(default)]
+        pub enabled_servers: Vec<String>,
+    }
+
+    /// Per-agent spawn configuration. Round 2 canonical name; superset of the
+    /// legacy `AgentDefinition` shape. Old fields (`description`, `model`,
+    /// `temperature`, `access`, `visible`, `max_turns`, `color`) preserved for
+    /// settings.json round-trip; `prompt` renamed to `append_system_prompt` with
+    /// serde alias. New fields are additive with `#[serde(default)]`.
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct AgentDefinition {
+    pub struct AgentConfig {
+        // ---- legacy fields (serde-stable) ----
         /// Display name / description
         pub description: Option<String>,
         /// Model override for this agent (e.g., "anthropic/claude-haiku-4-5")
         pub model: Option<String>,
         /// Temperature override
         pub temperature: Option<f64>,
-        /// System prompt prefix (prepended before the main system prompt)
-        pub prompt: Option<String>,
-        /// Permission restriction: "full", "read-only", "search-only"
+        /// System prompt suffix appended after the main system prompt.
+        /// Renamed from `prompt`; old JSON deserializes via the alias.
+        #[serde(default, alias = "prompt")]
+        pub append_system_prompt: Option<String>,
+        /// Legacy permission-preset shorthand: "full" / "read-only" / "search-only".
+        /// Spawn-side prefers `tools.allowlist` when non-empty; otherwise falls back
+        /// to the access preset. Will be removed once all settings.json files migrate.
         #[serde(default = "default_agent_access")]
         pub access: String,
         /// Whether to show in @agent autocomplete
@@ -721,19 +753,70 @@ pub mod config {
         pub max_turns: Option<u32>,
         /// ANSI color for display: "cyan", "magenta", "green", etc.
         pub color: Option<String>,
+
+        // ---- Round 2 additive fields ----
+        /// System prompt prefix (replaces full system prompt when set).
+        #[serde(default)]
+        pub system_prompt: Option<String>,
+        /// Hard cap on per-call output tokens. `None` = inherit global config.
+        #[serde(default)]
+        pub max_tokens: Option<u32>,
+        /// Fallback model on primary failure. `None` = inherit global config.
+        #[serde(default)]
+        pub fallback_model: Option<String>,
+        /// Output style override (terse/verbose/learning/...).
+        #[serde(default)]
+        pub output_style: Option<OutputStyle>,
+        /// Effort level as raw string ("low"/"medium"/"high"/"max"); parsed at apply-time.
+        #[serde(default)]
+        pub effort: Option<String>,
+        /// Per-call thinking budget in tokens.
+        #[serde(default)]
+        pub thinking_budget: Option<u32>,
+        /// Per-call tool-result budget in characters/tokens (impl-defined).
+        #[serde(default)]
+        pub tool_result_budget: Option<usize>,
+        /// Project name reference (resolves via `LiveSession.lookup_project`).
+        #[serde(default)]
+        pub project: Option<String>,
+        /// Whether the Kairos system-prompt addendum applies on spawn.
+        #[serde(default)]
+        pub kairos_addendum: bool,
+        /// Per-agent restriction over the runtime tool registry.
+        #[serde(default)]
+        pub tools: ToolConfig,
+        /// Per-agent restriction over the unified MCP server registry.
+        #[serde(default)]
+        pub mcp: MCPConfig,
     }
 
-    impl Default for AgentDefinition {
+    /// Back-compat alias: keeps existing call sites compiling while Phase 8 plumbs
+    /// the new name through. Delete the alias in a follow-up phase once all
+    /// callers import `AgentConfig` directly.
+    pub type AgentDefinition = AgentConfig;
+
+    impl Default for AgentConfig {
         fn default() -> Self {
             Self {
                 description: None,
                 model: None,
                 temperature: None,
-                prompt: None,
+                append_system_prompt: None,
                 access: default_agent_access(),
                 visible: true,
                 max_turns: None,
                 color: None,
+                system_prompt: None,
+                max_tokens: None,
+                fallback_model: None,
+                output_style: None,
+                effort: None,
+                thinking_budget: None,
+                tool_result_budget: None,
+                project: None,
+                kairos_addendum: false,
+                tools: ToolConfig::default(),
+                mcp: MCPConfig::default(),
             }
         }
     }
@@ -1101,33 +1184,26 @@ pub mod config {
         let mut m = HashMap::new();
         m.insert("build".to_string(), AgentDefinition {
             description: Some("Full-access agent for implementing features and fixing bugs".to_string()),
-            model: None,
-            temperature: None,
-            prompt: Some("You are the build agent. You have full access to read, write, and execute. Focus on implementing the requested changes completely and correctly.".to_string()),
+            append_system_prompt: Some("You are the build agent. You have full access to read, write, and execute. Focus on implementing the requested changes completely and correctly.".to_string()),
             access: "full".to_string(),
-            visible: true,
-            max_turns: None,
             color: Some("cyan".to_string()),
+            ..Default::default()
         });
         m.insert("plan".to_string(), AgentDefinition {
             description: Some("Read-only agent for analyzing code and planning changes".to_string()),
-            model: None,
-            temperature: None,
-            prompt: Some("You are the plan agent. You can read files and analyze code but cannot write files or execute commands. Focus on understanding the codebase and describing what changes should be made.".to_string()),
+            append_system_prompt: Some("You are the plan agent. You can read files and analyze code but cannot write files or execute commands. Focus on understanding the codebase and describing what changes should be made.".to_string()),
             access: "read-only".to_string(),
-            visible: true,
             max_turns: Some(20),
             color: Some("yellow".to_string()),
+            ..Default::default()
         });
         m.insert("explore".to_string(), AgentDefinition {
             description: Some("Fast search-only agent for code exploration".to_string()),
-            model: None,
-            temperature: None,
-            prompt: Some("You are the explore agent. You can search and read files. Focus on quickly finding relevant code and answering questions about the codebase.".to_string()),
+            append_system_prompt: Some("You are the explore agent. You can search and read files. Focus on quickly finding relevant code and answering questions about the codebase.".to_string()),
             access: "search-only".to_string(),
-            visible: true,
             max_turns: Some(15),
             color: Some("green".to_string()),
+            ..Default::default()
         });
         m
     }
@@ -1923,12 +1999,149 @@ pub mod permissions {
         Deny,
     }
 
+    /// Lifetime + persistence scope of a permission rule.
+    ///
+    /// Round 2 extension: `Once` and `Project { name }` added; `Persistent`
+    /// renamed to `Forever` with a serde alias so old `settings.json` keeps
+    /// loading. Emit-side writes the new spelling.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub enum PermissionScope {
-        /// Only lasts for the current process session.
+        /// Single-call decision; never persisted, never tracked in the manager.
+        /// Resolved inline by tool dispatch and dropped immediately after.
+        Once,
+        /// Lasts for the current process session only.
         Session,
+        /// Persisted in a specific `ProjectConfig` on disk; loaded when the
+        /// project is active. Disjoint from `Forever`.
+        Project { name: String },
         /// Saved to settings.json and survives restarts.
-        Persistent,
+        #[serde(alias = "Persistent")]
+        Forever,
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 9 — subject matchers
+    // -----------------------------------------------------------------------
+
+    /// Path access mode for `PermissionSubject::Path`.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum PathMode {
+        Read,
+        Write,
+        Any,
+    }
+
+    /// Lightweight input-shape matcher for `ToolInput` subject.
+    /// Round 2 baseline: substring match on the JSON-encoded input. Future
+    /// phases can extend with JsonPath / regex / typed matchers.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum InputMatcher {
+        /// Match if the JSON-encoded input contains this substring.
+        Contains(String),
+        /// Match any input.
+        Any,
+    }
+
+    /// URL pattern matcher for `Url` subject. Glob-style (matches via
+    /// `glob::Pattern`).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct UrlPattern(pub String);
+
+    /// Shell selector for `Command` subject.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum Shell {
+        Bash,
+        Powershell,
+        Any,
+    }
+
+    /// Command pattern matcher for `Command` subject. Glob-style match against
+    /// the literal command line.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct CommandPattern(pub String);
+
+    /// Subject of a permission rule. When set on a `PermissionRule`, this
+    /// supersedes the legacy `tool_name` + `path_pattern` fields.
+    ///
+    /// Phase 9 baseline: enum + variants exist; `evaluate()` integration in
+    /// task #29.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum PermissionSubject {
+        /// Match by tool name.
+        Tool { name: String },
+        /// Match by tool name AND an input shape matcher.
+        ToolInput { name: String, input_match: InputMatcher },
+        /// Filesystem path with access mode.
+        Path { path: std::path::PathBuf, mode: PathMode },
+        /// Outbound URL pattern (WebFetch).
+        Url { pattern: UrlPattern },
+        /// Shell command pattern (Bash / PowerShell tools).
+        Command { shell: Shell, pattern: CommandPattern },
+        /// Composite — matches if **all** inner subjects match.
+        Composite(Vec<PermissionSubject>),
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 9 — task source attribution
+    // -----------------------------------------------------------------------
+
+    /// Who initiated the work that triggered a permission request. Lives on
+    /// `PendingPermissionRequest` only — answers "who is asking *now*" so the
+    /// TUI dialog can attribute the prompt. Rules themselves carry no author
+    /// (Round 2 decision A1).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum TaskSource {
+        /// Foreground user session.
+        MainSession,
+        /// Inline slash command.
+        SlashCommand(String),
+        /// Cron-scheduled task; carries task id.
+        Cron(String),
+        /// Proactive ticker.
+        Proactive,
+        /// Spawned named agent; carries agent name.
+        Agent(String),
+        /// Background loop (`/btw`, etc.); carries loop id.
+        BgLoop(String),
+        /// Internal system event.
+        System,
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 9 — Kairos permission policy
+    // -----------------------------------------------------------------------
+
+    /// Policy applied to permission requests originating from non-foreground
+    /// sources (cron, proactive, background loops).
+    ///
+    /// Resolved at evaluate-time: `AgentConfig.kairos_policy` (per-agent) >
+    /// `KAIROS_PERMISSION_POLICY` env > default `DeferToUser`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum KairosPermissionPolicy {
+        /// Default: queue prompt for the foreground user to resolve.
+        DeferToUser,
+        /// Auto-allow read-only requests; writes still prompt.
+        AutoAllowRead,
+        /// Backend tools refuse without ever prompting.
+        Reject,
+    }
+
+    impl Default for KairosPermissionPolicy {
+        fn default() -> Self {
+            Self::DeferToUser
+        }
+    }
+
+    impl KairosPermissionPolicy {
+        /// Parse from env-style string. Unknown → `DeferToUser`.
+        pub fn from_env_str(s: &str) -> Self {
+            match s.to_ascii_lowercase().as_str() {
+                "defer" | "defer_to_user" | "defertouser" => Self::DeferToUser,
+                "read" | "auto_allow_read" | "autoallowread" => Self::AutoAllowRead,
+                "reject" => Self::Reject,
+                _ => Self::DeferToUser,
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1944,17 +2157,31 @@ pub mod permissions {
     ///     request path.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct PermissionRule {
+        /// Stable identifier for `/permissions revoke <id>`. Auto-assigned on
+        /// construction; preserved across serde round-trip when present.
+        #[serde(default = "uuid::Uuid::new_v4")]
+        pub id: uuid::Uuid,
         /// `None` means "applies to all tools".
         pub tool_name: Option<String>,
         /// Optional glob pattern for file / command paths.
         pub path_pattern: Option<String>,
         pub action: PermissionAction,
         pub scope: PermissionScope,
+        /// Phase 9 extension: when `Some`, supersedes `tool_name` +
+        /// `path_pattern` glob match. `None` = legacy match path.
+        #[serde(default)]
+        pub subject: Option<PermissionSubject>,
+        /// Wall-clock creation time. Used by `/permissions` listing.
+        #[serde(default = "chrono::Utc::now")]
+        pub created_at: chrono::DateTime<chrono::Utc>,
     }
 
     impl PermissionRule {
         /// Returns `true` when this rule matches the given tool name and
         /// optional path argument.
+        ///
+        /// Legacy match path. Use `matches_request` for subject-aware
+        /// dispatch when a full `PermissionRequest` is in hand.
         pub fn matches(&self, tool_name: &str, path: Option<&str>) -> bool {
             // Tool name check
             if let Some(ref rule_tool) = self.tool_name {
@@ -1977,6 +2204,120 @@ pub mod permissions {
                 }
             }
             true
+        }
+
+        /// Construct a legacy-shape rule (no subject). Auto-fills `id` and
+        /// `created_at`. Preferred over struct-literal builds at call sites.
+        pub fn legacy(
+            tool_name: Option<String>,
+            path_pattern: Option<String>,
+            action: PermissionAction,
+            scope: PermissionScope,
+        ) -> Self {
+            Self {
+                id: uuid::Uuid::new_v4(),
+                tool_name,
+                path_pattern,
+                action,
+                scope,
+                subject: None,
+                created_at: chrono::Utc::now(),
+            }
+        }
+
+        /// Subject-aware match. When `self.subject` is set, dispatches
+        /// through `PermissionSubject::matches_request`; otherwise falls
+        /// back to legacy `matches()` against the request's tool name and
+        /// best-effort path extraction.
+        pub fn matches_request(&self, req: &PermissionRequest) -> bool {
+            if let Some(ref subj) = self.subject {
+                return subj.matches_request(req);
+            }
+            // Legacy fallback: best-effort path extraction from
+            // context_description (e.g. "write file: /path/x").
+            let path = req
+                .context_description
+                .as_deref()
+                .and_then(|s| s.split_once(": ").map(|(_, rest)| rest));
+            self.matches(&req.tool_name, path)
+        }
+    }
+
+    impl PermissionSubject {
+        /// Phase 9 baseline matcher. Pragmatic: relies on `tool_name`,
+        /// `is_read_only`, and substring scans of `description` /
+        /// `context_description`. Rich structured matching arrives when
+        /// tool-input is threaded into `PermissionRequest`.
+        pub fn matches_request(&self, req: &PermissionRequest) -> bool {
+            match self {
+                PermissionSubject::Tool { name } => req.tool_name == *name,
+                PermissionSubject::ToolInput { name, input_match } => {
+                    if req.tool_name != *name {
+                        return false;
+                    }
+                    match input_match {
+                        InputMatcher::Any => true,
+                        InputMatcher::Contains(needle) => {
+                            req.details.as_deref().is_some_and(|d| d.contains(needle))
+                                || req
+                                    .context_description
+                                    .as_deref()
+                                    .is_some_and(|d| d.contains(needle))
+                                || req.description.contains(needle)
+                        }
+                    }
+                }
+                PermissionSubject::Path { path, mode } => {
+                    let mode_ok = match mode {
+                        PathMode::Any => true,
+                        PathMode::Read => req.is_read_only,
+                        PathMode::Write => !req.is_read_only,
+                    };
+                    if !mode_ok {
+                        return false;
+                    }
+                    let needle = path.to_string_lossy();
+                    req.context_description
+                        .as_deref()
+                        .is_some_and(|d| d.contains(needle.as_ref()))
+                        || req.description.contains(needle.as_ref())
+                }
+                PermissionSubject::Url { pattern } => {
+                    let Ok(pat) = glob::Pattern::new(&pattern.0) else {
+                        return false;
+                    };
+                    let scan = req
+                        .context_description
+                        .as_deref()
+                        .unwrap_or(&req.description);
+                    scan.split_whitespace().any(|tok| pat.matches(tok))
+                }
+                PermissionSubject::Command { shell, pattern } => {
+                    let shell_ok = match shell {
+                        Shell::Any => true,
+                        Shell::Bash => req.tool_name.eq_ignore_ascii_case("Bash"),
+                        Shell::Powershell => {
+                            let n = &req.tool_name;
+                            n.eq_ignore_ascii_case("PowerShell")
+                                || n.eq_ignore_ascii_case("Powershell")
+                        }
+                    };
+                    if !shell_ok {
+                        return false;
+                    }
+                    let Ok(pat) = glob::Pattern::new(&pattern.0) else {
+                        return false;
+                    };
+                    let scan = req
+                        .context_description
+                        .as_deref()
+                        .unwrap_or(&req.description);
+                    pat.matches(scan)
+                }
+                PermissionSubject::Composite(parts) => {
+                    parts.iter().all(|p| p.matches_request(req))
+                }
+            }
         }
     }
 
@@ -2007,10 +2348,13 @@ pub mod permissions {
     impl From<&SerializedPermissionRule> for PermissionRule {
         fn from(s: &SerializedPermissionRule) -> Self {
             Self {
+                id: uuid::Uuid::new_v4(),
                 tool_name: s.tool_name.clone(),
                 path_pattern: s.path_pattern.clone(),
                 action: s.action.clone(),
-                scope: PermissionScope::Persistent,
+                scope: PermissionScope::Forever,
+                subject: None,
+                created_at: chrono::Utc::now(),
             }
         }
     }
@@ -2224,29 +2568,32 @@ pub mod permissions {
         /// Add an arbitrary rule to this manager.
         pub fn add_rule(&mut self, rule: PermissionRule) {
             match rule.scope {
+                PermissionScope::Once => { /* never tracked — request-scope only */ }
                 PermissionScope::Session => self.session_rules.push(rule),
-                PermissionScope::Persistent => self.persistent_rules.push(rule),
+                // TODO Phase 8.5: route to per-project storage slot once wired.
+                PermissionScope::Project { .. } => self.persistent_rules.push(rule),
+                PermissionScope::Forever => self.persistent_rules.push(rule),
             }
         }
 
         /// Allow `tool_name` for the rest of this session.
         pub fn add_session_allow(&mut self, tool_name: &str) {
-            self.session_rules.push(PermissionRule {
-                tool_name: Some(tool_name.to_string()),
-                path_pattern: None,
-                action: PermissionAction::Allow,
-                scope: PermissionScope::Session,
-            });
+            self.session_rules.push(PermissionRule::legacy(
+                Some(tool_name.to_string()),
+                None,
+                PermissionAction::Allow,
+                PermissionScope::Session,
+            ));
         }
 
         /// Allow `tool_name` on `path` (glob) for the rest of this session.
         pub fn add_session_allow_path(&mut self, tool_name: &str, path: &str) {
-            self.session_rules.push(PermissionRule {
-                tool_name: Some(tool_name.to_string()),
-                path_pattern: Some(path.to_string()),
-                action: PermissionAction::Allow,
-                scope: PermissionScope::Session,
-            });
+            self.session_rules.push(PermissionRule::legacy(
+                Some(tool_name.to_string()),
+                Some(path.to_string()),
+                PermissionAction::Allow,
+                PermissionScope::Session,
+            ));
         }
 
         /// Allow `tool_name` persistently and save to settings.
@@ -2255,12 +2602,12 @@ pub mod permissions {
             tool_name: &str,
             settings: &mut crate::config::Settings,
         ) -> crate::error::Result<()> {
-            let rule = PermissionRule {
-                tool_name: Some(tool_name.to_string()),
-                path_pattern: None,
-                action: PermissionAction::Allow,
-                scope: PermissionScope::Persistent,
-            };
+            let rule = PermissionRule::legacy(
+                Some(tool_name.to_string()),
+                None,
+                PermissionAction::Allow,
+                PermissionScope::Forever,
+            );
             let serialized = SerializedPermissionRule::from(&rule);
             settings.permission_rules.push(serialized);
             settings
@@ -2555,12 +2902,12 @@ pub mod permissions {
         fn deny_beats_allow() {
             let mut m = mgr(PermissionMode::Default);
             m.add_session_allow("Bash");
-            m.add_rule(PermissionRule {
-                tool_name: Some("Bash".to_string()),
-                path_pattern: None,
-                action: PermissionAction::Deny,
-                scope: PermissionScope::Session,
-            });
+            m.add_rule(PermissionRule::legacy(
+                Some("Bash".to_string()),
+                None,
+                PermissionAction::Deny,
+                PermissionScope::Session,
+            ));
             assert_eq!(m.evaluate("Bash", "echo hi", None), PermissionDecision::Deny);
         }
 
@@ -2594,12 +2941,12 @@ pub mod permissions {
         #[test]
         fn glob_path_allow_matches() {
             let mut m = mgr(PermissionMode::Default);
-            m.add_rule(PermissionRule {
-                tool_name: Some("Write".to_string()),
-                path_pattern: Some("/tmp/**".to_string()),
-                action: PermissionAction::Allow,
-                scope: PermissionScope::Session,
-            });
+            m.add_rule(PermissionRule::legacy(
+                Some("Write".to_string()),
+                Some("/tmp/**".to_string()),
+                PermissionAction::Allow,
+                PermissionScope::Session,
+            ));
             assert_eq!(
                 m.evaluate("Write", "write", Some("/tmp/foo/bar.txt")),
                 PermissionDecision::Allow
@@ -2609,12 +2956,12 @@ pub mod permissions {
         #[test]
         fn glob_path_no_match_asks() {
             let mut m = mgr(PermissionMode::Default);
-            m.add_rule(PermissionRule {
-                tool_name: Some("Write".to_string()),
-                path_pattern: Some("/tmp/**".to_string()),
-                action: PermissionAction::Allow,
-                scope: PermissionScope::Session,
-            });
+            m.add_rule(PermissionRule::legacy(
+                Some("Write".to_string()),
+                Some("/tmp/**".to_string()),
+                PermissionAction::Allow,
+                PermissionScope::Session,
+            ));
             match m.evaluate("Write", "write", Some("/etc/hosts")) {
                 PermissionDecision::Ask { .. } => {}
                 other => panic!("Expected Ask, got {:?}", other),
@@ -3443,6 +3790,10 @@ pub mod migrations;
 pub mod output_styles;
 pub mod feature_gates;
 pub mod kairos_gate;
+pub mod event_log;
+pub mod live_session;
+pub mod project_registry;
+pub mod task_tracker;
 pub mod tips;
 pub mod remote_settings;
 pub mod settings_sync;

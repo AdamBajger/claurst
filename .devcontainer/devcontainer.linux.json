@@ -1,0 +1,41 @@
+{
+  "name": "claurst-rust",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": false,
+      "username": "vscode",
+      "uid": "1000",
+      "gid": "1000"
+    },
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+
+  "remoteUser": "vscode",
+
+  "mounts": [
+    "source=${localEnv:HOME}/.gnupg,target=/home/vscode/.gnupg,type=bind,consistency=cached",
+    "source=/run/user/1000/gnupg/S.gpg-agent,target=/tmp/S.gpg-agent,type=bind"
+  ],
+
+  "remoteEnv": {
+    "GNUPGHOME": "/home/vscode/.gnupg"
+  },
+
+  "postCreateCommand": "mkdir -p ~/.gnupg && chmod 700 ~/.gnupg && echo 'use-agent' >> ~/.gnupg/gpg.conf",
+
+  "postStartCommand": "ln -sf /tmp/S.gpg-agent $(gpgconf --list-dirs agent-socket) && export GPG_TTY=$(tty)",
+
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.inheritEnv": true,
+        "git.enableCommitSigning": true
+      }
+    }
+  }
+}

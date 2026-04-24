@@ -18,4 +18,5 @@ refs/
 .vscode
 .vscode/settings.json
 .claurst
+!.claurst/.placeholder
 

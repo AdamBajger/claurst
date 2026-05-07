@@ -139,3 +139,48 @@ fn tracker_clone_shares_inner_state() {
     t2.deregister("x");
     assert!(t1.is_empty());
 }
+
+#[test]
+fn tool_call_task_registers_and_deregisters_on_terminal() {
+    // Smoke-test the SimpleTrackedTask lifecycle for the Tool variant. The
+    // actual `query::execute_tool` registers via `task_tracker.register`
+    // around `tool.execute()` and deregisters on terminal status.
+    let tracker = TaskTracker::new();
+    let task = SimpleTrackedTask::new(
+        "tool:Bash:abc",
+        TaskKind::Tool,
+        TaskSource::MainSession,
+        "tool Bash",
+        CancellationToken::new(),
+    );
+    tracker.register(task.clone());
+    assert_eq!(tracker.len(), 1);
+    assert_eq!(task.kind(), TaskKind::Tool);
+
+    task.set_status(TaskStatus::Completed);
+    tracker.deregister(task.id());
+    assert!(tracker.is_empty());
+    assert!(task.status().is_terminal());
+}
+
+#[test]
+fn subagent_task_lifecycle() {
+    let tracker = TaskTracker::new();
+    let task = SimpleTrackedTask::new(
+        "subagent:abc",
+        TaskKind::Subagent,
+        TaskSource::Agent("research".into()),
+        "subagent: research",
+        CancellationToken::new(),
+    );
+    tracker.register(task.clone());
+    assert_eq!(task.kind(), TaskKind::Subagent);
+    assert!(matches!(task.source(), TaskSource::Agent(n) if n == "research"));
+
+    // Cancel via tracker → token signals → producer flips status.
+    let token = task.cancel_token().clone();
+    tracker.cancel(task.id());
+    assert!(token.is_cancelled());
+    task.set_status(TaskStatus::Cancelled);
+    assert_eq!(task.status(), TaskStatus::Cancelled);
+}

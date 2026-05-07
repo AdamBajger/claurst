@@ -52,6 +52,8 @@ fn legacy_serialized_rule_loads_with_fresh_id_and_timestamp() {
         tool_name: Some("Bash".into()),
         path_pattern: None,
         action: PermissionAction::Allow,
+        id: None,
+        subject: None,
     };
     let rule: PermissionRule = (&serialized).into();
     assert!(rule.subject.is_none());
@@ -258,4 +260,139 @@ fn kairos_policy_from_env_str_recognizes_aliases() {
         KairosPermissionPolicy::from_env_str("nonsense"),
         KairosPermissionPolicy::DeferToUser
     );
+}
+
+// ---- evaluate_with_source: source-aware policy routing --------------------
+
+use claurst_core::config::PermissionMode;
+use claurst_core::permissions::{PermissionDecision, PermissionManager};
+use claurst_core::{AgentConfig, Settings};
+
+fn fresh_manager() -> PermissionManager {
+    PermissionManager::new(PermissionMode::Default, &Settings::default())
+}
+
+#[test]
+fn evaluate_with_source_foreground_unchanged_by_policy() {
+    let m = fresh_manager();
+    let r = req("Bash", Some("echo hi"), false);
+    // MainSession is foreground → policy ignored, base Ask preserved.
+    let d = m.evaluate_with_source(&r, Some(&TaskSource::MainSession), KairosPermissionPolicy::Reject);
+    assert!(matches!(d, PermissionDecision::Ask { .. }));
+}
+
+#[test]
+fn evaluate_with_source_background_reject_collapses_ask_to_deny() {
+    let m = fresh_manager();
+    let r = req("Bash", Some("echo hi"), false);
+    let d = m.evaluate_with_source(
+        &r,
+        Some(&TaskSource::Cron("nightly".into())),
+        KairosPermissionPolicy::Reject,
+    );
+    assert_eq!(d, PermissionDecision::Deny);
+}
+
+#[test]
+fn evaluate_with_source_background_defer_keeps_ask() {
+    let m = fresh_manager();
+    let r = req("Bash", Some("echo hi"), false);
+    let d = m.evaluate_with_source(
+        &r,
+        Some(&TaskSource::Proactive),
+        KairosPermissionPolicy::DeferToUser,
+    );
+    assert!(matches!(d, PermissionDecision::Ask { .. }));
+}
+
+#[test]
+fn evaluate_with_source_background_auto_allow_read_only_when_read_only() {
+    let m = fresh_manager();
+    // is_read_only = true; default level for "Bash" is Execute → would Ask.
+    let r = req("Bash", Some("inspect: cat /tmp/x"), true);
+    let d = m.evaluate_with_source(
+        &r,
+        Some(&TaskSource::Agent("docs-rag".into())),
+        KairosPermissionPolicy::AutoAllowRead,
+    );
+    assert_eq!(d, PermissionDecision::Allow);
+}
+
+#[test]
+fn evaluate_with_source_background_auto_allow_does_not_help_writes() {
+    let m = fresh_manager();
+    let r = req("Bash", Some("write: rm /tmp/x"), false);
+    let d = m.evaluate_with_source(
+        &r,
+        Some(&TaskSource::BgLoop("btw-1".into())),
+        KairosPermissionPolicy::AutoAllowRead,
+    );
+    // Writes still prompt.
+    assert!(matches!(d, PermissionDecision::Ask { .. }));
+}
+
+#[test]
+fn evaluate_with_source_explicit_allow_rule_beats_policy() {
+    let mut m = fresh_manager();
+    m.add_session_allow("Bash");
+    let r = req("Bash", Some("echo hi"), false);
+    let d = m.evaluate_with_source(
+        &r,
+        Some(&TaskSource::Cron("any".into())),
+        // Reject would normally Deny, but an explicit Allow rule wins first.
+        KairosPermissionPolicy::Reject,
+    );
+    assert_eq!(d, PermissionDecision::Allow);
+}
+
+#[test]
+fn evaluate_with_source_no_source_treated_as_foreground() {
+    let m = fresh_manager();
+    let r = req("Bash", Some("echo hi"), false);
+    let d = m.evaluate_with_source(&r, None, KairosPermissionPolicy::Reject);
+    assert!(matches!(d, PermissionDecision::Ask { .. }));
+}
+
+// ---- PendingPermission source attribution --------------------------------
+
+#[test]
+fn register_pending_with_source_round_trips_via_snapshot() {
+    let mut m = fresh_manager();
+    let _rx = m.register_pending_with_source(
+        "tool-use-1".into(),
+        Some(TaskSource::Cron("nightly".into())),
+    );
+    let _rx2 = m.register_pending("tool-use-2".into());
+    let snap = m.pending_snapshot();
+    assert_eq!(snap.len(), 2);
+    assert_eq!(snap[0].0, "tool-use-1");
+    assert_eq!(snap[0].1, Some(TaskSource::Cron("nightly".into())));
+    // Legacy register_pending stores no source.
+    assert_eq!(snap[1].0, "tool-use-2");
+    assert_eq!(snap[1].1, None);
+}
+
+// ---- AgentConfig.kairos_policy field --------------------------------------
+
+#[test]
+fn agent_config_kairos_policy_serde_round_trip() {
+    let mut cfg = AgentConfig::default();
+    cfg.kairos_policy = Some(KairosPermissionPolicy::Reject);
+    let json = serde_json::to_string(&cfg).unwrap();
+    let back: AgentConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.kairos_policy, Some(KairosPermissionPolicy::Reject));
+}
+
+#[test]
+fn agent_config_kairos_policy_default_none() {
+    let cfg = AgentConfig::default();
+    assert!(cfg.kairos_policy.is_none());
+}
+
+#[test]
+fn agent_config_legacy_json_without_kairos_policy_loads_as_none() {
+    // Existing settings.json has no `kairos_policy` field — must deserialize.
+    let json = r#"{"description":null,"model":null,"temperature":null,"access":"full","visible":true,"max_turns":null,"color":null}"#;
+    let cfg: AgentConfig = serde_json::from_str(json).expect("parse");
+    assert!(cfg.kairos_policy.is_none());
 }

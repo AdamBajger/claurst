@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -398,7 +398,7 @@ pub fn add_to_history(entry: HistoryEntry) {
 
     // Push to pending buffer and record as last-added.
     let to_flush = {
-        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = STATE.lock();
         state.pending.push(log_entry.clone());
         state.last_added = Some(log_entry);
         // Drain the pending buffer to hand off to the flush task.
@@ -420,7 +420,7 @@ pub async fn get_history(
     let path = history_path();
 
     let (pending, skipped) = {
-        let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let state = STATE.lock();
         (state.pending.clone(), state.skipped_timestamps.clone())
     };
 
@@ -667,7 +667,7 @@ fn parse_references_with_positions(input: &str) -> Vec<(u32, String, usize)> {
 ///
 /// Fast path: remove from pending buffer.  Slow path: add timestamp to skip-set.
 pub fn remove_last_from_history() {
-    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = STATE.lock();
     let Some(entry) = state.last_added.take() else {
         return;
     };
@@ -685,7 +685,7 @@ pub fn remove_last_from_history() {
 
 /// Wipe all pending entries and state (used in tests).
 pub fn clear_pending_history_entries() {
-    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = STATE.lock();
     state.pending.clear();
     state.last_added = None;
     state.skipped_timestamps.clear();

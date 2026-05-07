@@ -7,8 +7,10 @@ src-rust/target/
 # Refs
 refs/
 
-# Claude
+# Agents
 .claude
+.claurst
+!.claurst/.placeholder
 
 # Git
 .gitignore
@@ -17,6 +19,8 @@ refs/
 # VSCode / unsolicited devcontainers mounts
 .vscode
 .vscode/settings.json
-.claurst
-!.claurst/.placeholder
 
+# workspaces
+.workspaces
+
+*.txt

@@ -161,3 +161,268 @@ fn agent_config_with_project_resolves_via_live_session() {
     let resolved = live.resolve_cwd(None, agent.project.as_deref());
     assert_eq!(resolved, project_root);
 }
+
+#[test]
+fn switch_project_loads_rules_into_permission_manager() {
+    use claurst_core::permissions::{PermissionAction, PermissionScope, SerializedPermissionRule};
+
+    let settings = Settings::default();
+    let cost = CostTracker::new();
+    let perm = PermissionManager::new(PermissionMode::Default, &settings);
+
+    let mut reg = ProjectRegistry::new();
+    let mut alpha = ProjectConfig::new("alpha", PathBuf::from("/tmp/alpha"));
+    alpha.permission_rules.push(SerializedPermissionRule {
+        tool_name: Some("Bash".to_string()),
+        path_pattern: None,
+        action: PermissionAction::Allow,
+        id: None,
+        subject: None,
+    });
+    reg.insert(alpha);
+
+    let live = LiveSession::with_projects(settings, std::env::temp_dir(), cost, perm, reg);
+
+    // Before switch: no active project, Bash should still Ask (default).
+    let decision_before = live
+        .runtime
+        .permissions
+        .lock()
+        .evaluate("Bash", "echo hi", None);
+    assert!(matches!(
+        decision_before,
+        claurst_core::permissions::PermissionDecision::Ask { .. }
+    ));
+
+    live.switch_project("alpha").expect("switch ok");
+
+    // After switch: active project's Allow rule wins.
+    let perm_guard = live.runtime.permissions.lock();
+    assert_eq!(perm_guard.active_project(), Some("alpha"));
+    let decision_after = perm_guard.evaluate("Bash", "echo hi", None);
+    assert_eq!(
+        decision_after,
+        claurst_core::permissions::PermissionDecision::Allow
+    );
+    // Loaded rules carry Project scope (overwritten by loader regardless of
+    // the on-disk serde, which doesn't store scope).
+    let listed = perm_guard.list_rules();
+    assert!(listed.iter().any(|r| matches!(
+        &r.scope,
+        PermissionScope::Project { name } if name == "alpha"
+    )));
+    drop(perm_guard);
+
+    live.clear_active_project();
+    // Cleared bucket no longer participates.
+    let cleared = live
+        .runtime
+        .permissions
+        .lock()
+        .evaluate("Bash", "echo hi", None);
+    assert!(matches!(
+        cleared,
+        claurst_core::permissions::PermissionDecision::Ask { .. }
+    ));
+}
+
+#[test]
+fn persist_project_rule_appends_to_disk_and_registry() {
+    use claurst_core::permissions::{
+        PermissionAction, PermissionRule, PermissionScope, PermissionSubject,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("projects");
+
+    // Bootstrap a project on disk so persist_project_rule has something to update.
+    let alpha = ProjectConfig::new("alpha", PathBuf::from("/tmp/alpha"));
+    ProjectRegistry::save_one(&dir, &alpha).expect("save project");
+    let registry = ProjectRegistry::load_from_dir(&dir).expect("reload");
+
+    let settings = Settings::default();
+    let cost = CostTracker::new();
+    let perm = PermissionManager::new(PermissionMode::Default, &settings);
+    let live =
+        LiveSession::with_projects(settings, std::env::temp_dir(), cost, perm, registry);
+
+    let mut rule = PermissionRule::legacy(
+        None,
+        None,
+        PermissionAction::Allow,
+        PermissionScope::Project { name: "alpha".into() },
+    );
+    rule.subject = Some(PermissionSubject::Tool { name: "Bash".into() });
+
+    live
+        .persist_project_rule("alpha", &rule, Some(&dir))
+        .expect("persist");
+
+    // Reload from disk and confirm the rule is present with id + subject.
+    let reloaded = ProjectRegistry::load_from_dir(&dir).expect("reload");
+    let cfg = reloaded.get("alpha").expect("alpha present");
+    assert_eq!(cfg.permission_rules.len(), 1);
+    let serialized = &cfg.permission_rules[0];
+    assert_eq!(serialized.id, Some(rule.id));
+    assert!(matches!(
+        serialized.subject,
+        Some(PermissionSubject::Tool { ref name }) if name == "Bash"
+    ));
+
+    // Removal mirror — happy path.
+    let removed = live
+        .persist_remove_project_rule("alpha", rule.id, Some(&dir))
+        .expect("remove");
+    assert!(removed);
+    let reloaded = ProjectRegistry::load_from_dir(&dir).expect("reload");
+    let cfg = reloaded.get("alpha").expect("alpha present");
+    assert!(cfg.permission_rules.is_empty());
+
+    // Removing again is a no-op (returns false).
+    let removed_again = live
+        .persist_remove_project_rule("alpha", rule.id, Some(&dir))
+        .expect("remove again");
+    assert!(!removed_again);
+}
+
+#[test]
+fn load_from_dir_with_failures_reports_skipped_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("projects");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("garbage.json"), b"{not valid json").unwrap();
+    std::fs::write(dir.join("not_json.txt"), b"ignored").unwrap();
+    let cfg = ProjectConfig::new("good", PathBuf::from("/tmp/good"));
+    ProjectRegistry::save_one(&dir, &cfg).expect("save");
+
+    let (reg, failed) =
+        ProjectRegistry::load_from_dir_with_failures(&dir).expect("load");
+    assert_eq!(reg.len(), 1);
+    assert!(reg.get("good").is_some());
+    // garbage.json reported, not_json.txt ignored entirely (not a JSON file).
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0], "garbage.json");
+}
+
+#[test]
+fn load_from_missing_dir_with_failures_returns_empty_no_failures() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("nope");
+    let (reg, failed) =
+        ProjectRegistry::load_from_dir_with_failures(&missing).expect("ok");
+    assert!(reg.is_empty());
+    assert!(failed.is_empty());
+}
+
+#[test]
+fn persist_project_rule_unknown_project_errors() {
+    use claurst_core::permissions::{PermissionAction, PermissionRule, PermissionScope};
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("projects");
+
+    let settings = Settings::default();
+    let cost = CostTracker::new();
+    let perm = PermissionManager::new(PermissionMode::Default, &settings);
+    let live = LiveSession::with_projects(
+        settings,
+        std::env::temp_dir(),
+        cost,
+        perm,
+        ProjectRegistry::new(),
+    );
+
+    let rule = PermissionRule::legacy(
+        Some("Read".into()),
+        None,
+        PermissionAction::Allow,
+        PermissionScope::Project { name: "ghost".into() },
+    );
+    let err = live
+        .persist_project_rule("ghost", &rule, Some(&dir))
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn switch_project_signals_mcp_reconnect_pending() {
+    let settings = Settings::default();
+    let cost = CostTracker::new();
+    let perm = PermissionManager::new(PermissionMode::Default, &settings);
+
+    let mut reg = ProjectRegistry::new();
+    reg.insert(ProjectConfig::new("alpha", PathBuf::from("/tmp/alpha")));
+    let live = LiveSession::with_projects(settings, std::env::temp_dir(), cost, perm, reg);
+
+    // Initially no signal.
+    assert!(!live.take_mcp_reconnect_pending());
+
+    live.switch_project("alpha").expect("switch");
+    // Take consumes — first read True, second read False.
+    assert!(live.take_mcp_reconnect_pending());
+    assert!(!live.take_mcp_reconnect_pending());
+
+    // Clearing the active project should also signal a reconnect (project-only
+    // servers must drop).
+    live.clear_active_project();
+    assert!(live.take_mcp_reconnect_pending());
+}
+
+#[test]
+fn active_project_mcp_specs_returns_project_servers() {
+    use claurst_core::config::McpServerConfig;
+    use std::collections::BTreeMap;
+
+    let settings = Settings::default();
+    let cost = CostTracker::new();
+    let perm = PermissionManager::new(PermissionMode::Default, &settings);
+
+    let mut reg = ProjectRegistry::new();
+    let mut alpha = ProjectConfig::new("alpha", PathBuf::from("/tmp/alpha"));
+    let mut servers = BTreeMap::new();
+    servers.insert(
+        "docs-rag".to_string(),
+        McpServerConfig {
+            name: "docs-rag".to_string(),
+            command: Some("docs-rag".into()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            server_type: "stdio".to_string(),
+        },
+    );
+    alpha.mcp_servers = servers;
+    reg.insert(alpha);
+
+    let live = LiveSession::with_projects(settings, std::env::temp_dir(), cost, perm, reg);
+
+    // No active project → empty.
+    assert!(live.active_project_mcp_specs().is_empty());
+
+    live.switch_project("alpha").expect("switch");
+    let specs = live.active_project_mcp_specs();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].name, "docs-rag");
+}
+
+#[test]
+fn add_rule_routes_project_scope_to_bucket() {
+    use claurst_core::permissions::{
+        PermissionAction, PermissionRule, PermissionScope,
+    };
+
+    let settings = Settings::default();
+    let mut perm = PermissionManager::new(PermissionMode::Default, &settings);
+    perm.add_rule(PermissionRule::legacy(
+        Some("Read".into()),
+        None,
+        PermissionAction::Allow,
+        PermissionScope::Project { name: "alpha".into() },
+    ));
+    // The bucket exists and contains the rule. The persistent + session
+    // buckets stay empty.
+    assert!(perm.persistent_rules.is_empty());
+    assert!(perm.session_rules.is_empty());
+    let bucket = perm.project_rules_for("alpha");
+    assert_eq!(bucket.len(), 1);
+    assert_eq!(bucket[0].tool_name.as_deref(), Some("Read"));
+}

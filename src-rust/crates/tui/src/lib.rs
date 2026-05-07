@@ -117,6 +117,8 @@ pub mod device_auth_dialog;
 pub mod voice_capture;
 /// Task progress overlay (Ctrl+T) — shows task status with inline toggle.
 pub mod tasks_overlay;
+/// Phase 10 — `/activity` scrollable event-log modal.
+pub mod activity_overlay;
 /// Session branching overlay (Ctrl+B) — create and switch between conversation branches.
 pub mod session_branching;
 

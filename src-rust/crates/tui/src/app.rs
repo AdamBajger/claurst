@@ -627,6 +627,15 @@ pub struct App {
     pub status_message: Option<String>,
     /// Randomly chosen thinking verb shown next to the spinner while streaming.
     pub spinner_verb: Option<String>,
+    /// Phase 10: most-recent EventLog summary surfaced on the welcome screen
+    /// "Recent activity" line and (eventually) the avatar status line. Updated
+    /// each tick from `EventLog::most_recent()` by the CLI loop.
+    pub recent_activity: Option<String>,
+    /// Phase 10: `/activity` scrollable modal state.
+    pub activity_overlay: crate::activity_overlay::ActivityOverlay,
+    /// Snapshot of EventLog events fed to the modal each tick. Refreshed
+    /// from the CLI loop; rendered by `render_activity_overlay`.
+    pub activity_events: Vec<claurst_core::event_log::Event>,
     pub should_quit: bool,
     pub show_help: bool,
 
@@ -1121,6 +1130,9 @@ impl App {
             streaming_thinking: String::new(),
             status_message: None,
             spinner_verb: None,
+            recent_activity: None,
+            activity_overlay: crate::activity_overlay::ActivityOverlay::new(),
+            activity_events: Vec::new(),
             should_quit: false,
             show_help: false,
             tool_use_blocks: Vec::new(),
@@ -2998,6 +3010,38 @@ impl App {
                         self.status_message = Some(format!("Task {} → {}", task_id, new_status));
                     }
                 }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Phase 10 — /activity scrollable modal key handling.
+        if self.activity_overlay.visible {
+            // Viewport approximated as 16 rows; modal layout has more but
+            // pagination caps at this for reasonable jumps. Render path uses
+            // actual frame height.
+            let viewport: usize = 16;
+            let total = self.activity_events.len();
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.activity_overlay.close(),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.activity_overlay.move_down(total, viewport);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.activity_overlay.move_up();
+                }
+                KeyCode::PageDown => {
+                    self.activity_overlay.page_down(total, viewport);
+                }
+                KeyCode::PageUp => {
+                    self.activity_overlay.page_up(viewport);
+                }
+                KeyCode::Char('g') => self.activity_overlay.jump_first(),
+                KeyCode::Char('G') => {
+                    self.activity_overlay.jump_last(total, viewport);
+                }
+                KeyCode::Char('f') => self.activity_overlay.cycle_filter(),
+                KeyCode::Char('d') => self.activity_overlay.toggle_expand(),
                 _ => {}
             }
             return false;

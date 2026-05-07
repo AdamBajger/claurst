@@ -460,8 +460,26 @@ impl Tool for AgentTool {
         // -----------------------------------------------------------------------
         // Synchronous mode: run the sub-agent loop and wait for completion.
         // -----------------------------------------------------------------------
-        let mut messages = vec![Message::user(params.prompt)];
+        let mut messages = vec![Message::user(params.prompt.clone())];
         let cancel = CancellationToken::new();
+
+        // Phase 9.5: register a `SubagentTask` so /tasks shows the in-flight
+        // sub-agent. Cancellation token shared with the loop so /tasks cancel
+        // <id> propagates.
+        let tracked_subagent = ctx.task_tracker.as_ref().map(|tracker| {
+            use claurst_core::permissions::TaskSource;
+            use claurst_core::task_tracker::{SimpleTrackedTask, TaskKind};
+            let id = format!("subagent:{}", uuid::Uuid::new_v4());
+            let task = SimpleTrackedTask::new(
+                id.clone(),
+                TaskKind::Subagent,
+                TaskSource::Agent(params.description.clone()),
+                format!("subagent: {}", params.description),
+                cancel.clone(),
+            );
+            tracker.register(task.clone());
+            (tracker.clone(), task, id)
+        });
 
         let outcome = run_query_loop(
             client.as_ref(),
@@ -475,6 +493,21 @@ impl Tool for AgentTool {
             None, // no pending message queue for sub-agents
         )
         .await;
+
+        if let Some((tracker, task, id)) = tracked_subagent.as_ref() {
+            use claurst_core::task_tracker::TaskStatus;
+            let final_status = match &outcome {
+                QueryOutcome::EndTurn { .. } => TaskStatus::Completed,
+                QueryOutcome::MaxTokens { .. } => TaskStatus::Completed,
+                QueryOutcome::Cancelled => TaskStatus::Cancelled,
+                QueryOutcome::BudgetExceeded { .. } => TaskStatus::Failed {
+                    error: "budget exceeded".into(),
+                },
+                QueryOutcome::Error(e) => TaskStatus::Failed { error: e.to_string() },
+            };
+            task.set_status(final_status);
+            tracker.deregister(id);
+        }
 
         // Cleanup worktree if one was created.
         if let (Some(root), Some(wt)) = (git_root, worktree_path) {

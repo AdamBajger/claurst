@@ -157,11 +157,20 @@ fn system_message_preserves_text() {
 
 #[test]
 fn thinking_block_collapsed() {
-    let lines = render_thinking_block("hidden thoughts", false);
+    // `render_thinking_block` extracts a first-line preview as the heading
+    // (see `transcript_turn::reasoning_heading`), so a collapsed block of
+    // single-line text would still echo the body. Use multi-line text so we
+    // can assert the body lines past the heading are not rendered.
+    let body = "summary of intent\n  detailed body line 1\n  detailed body line 2";
+    let lines = render_thinking_block(body, false);
     assert_eq!(lines.len(), 1);
     let text = flatten(&lines);
     assert!(text.contains("Thinking"));
-    assert!(!text.contains("hidden thoughts"));
+    // Heading preview included.
+    assert!(text.contains("summary of intent"));
+    // Subsequent body lines hidden.
+    assert!(!text.contains("detailed body line 1"));
+    assert!(!text.contains("detailed body line 2"));
 }
 
 #[test]

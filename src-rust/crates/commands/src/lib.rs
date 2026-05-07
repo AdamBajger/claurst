@@ -34,6 +34,12 @@ pub struct CommandContext {
     /// handles). `None` for pre-session named-command fast-paths and other
     /// contexts where the session has not been bootstrapped yet.
     pub live_session: Option<claurst_core::live_session::SharedLiveSession>,
+    /// Phase 9.5 task tracker. `None` in pre-session contexts; populated in
+    /// run_interactive so /tasks and /stop can inspect + cancel live work.
+    pub task_tracker: Option<claurst_core::task_tracker::TaskTracker>,
+    /// Phase 10 event log. `None` in pre-session contexts; populated in
+    /// run_interactive so /activity can render the ring.
+    pub event_log: Option<claurst_core::event_log::EventLog>,
 }
 
 /// Result of running a slash command.
@@ -70,12 +76,20 @@ pub enum CommandResult {
     /// Open the hooks configuration browser overlay in the TUI.
     /// Falls back to a text listing in non-TUI contexts.
     OpenHooksOverlay,
+    /// Phase 10 — open the scrollable `/activity` event-log modal in the TUI.
+    /// Falls back to the text rendering when no TUI overlay is mounted.
+    OpenActivityOverlay,
     /// Clear saved provider auth, model selection, and model caches, then
     /// rebuild the live runtime state.
     RefreshProviderState,
     /// Activate a speech mode (caveman/rocky) with level, or deactivate (normal).
     /// (mode, level) — mode=None means deactivate.
     SpeechMode { mode: Option<String>, level: String },
+    /// Phase 11 — `/agent <name> <prompt>` background spawn. The CLI loop
+    /// resolves `agent_name` against `LiveSession`, builds an `AgentRunRequest`
+    /// + `AgentRunContext`, and dispatches via `execute_agent_run`. The
+    /// invoking turn is NOT blocked.
+    SpawnNamedAgent { agent_name: String, prompt: String },
 }
 
 /// Execution policy for slash commands.
@@ -276,6 +290,10 @@ pub struct SearchCommand;
 pub struct ForkCommand;
 pub struct ManagedAgentsCommand;
 pub struct KairosCommand;
+// Round 2 — Phase 9.5 / 10 / 8.5 surface.
+pub struct StopCommand;
+pub struct ActivityCommand;
+pub struct ProjectCommand;
 pub struct NamedCommandAdapter {
     pub slash_name: &'static str,
     pub target_name: &'static str,
@@ -493,10 +511,11 @@ fn command_category(name: &str) -> &'static str {
         "session" | "resume" | "remote-control" | "remote-env"
         | "teleport" => "Sessions & Remote",
         "help" | "exit" | "feedback" | "bug" => "General",
-        "think-back" | "thinkback-play" | "thinking" | "plan" | "tasks" => "AI & Thinking",
+        "think-back" | "thinkback-play" | "thinking" | "plan" | "tasks" | "stop"
+        | "activity" => "AI & Thinking",
         "copy" | "skills" | "agents" | "plugin" | "reload-plugins"
         | "stickers" | "passes" | "desktop" | "mobile" | "btw" => "Tools & Extras",
-        "kairos" => "System",
+        "kairos" | "project" => "System",
         _ => "Other",
     }
 }
@@ -3358,19 +3377,155 @@ impl McpCommand {
 
 // ---- /permissions --------------------------------------------------------
 
+/// Parse a permission-rule scope spec: `once | session | forever | project[:NAME]`.
+/// `active_project` provides a fallback when the user wrote `project` without a name.
+fn parse_permission_scope_spec(
+    spec: &str,
+    active_project: Option<&str>,
+) -> Result<claurst_core::permissions::PermissionScope, String> {
+    use claurst_core::permissions::PermissionScope;
+    let spec = spec.trim();
+    if spec.eq_ignore_ascii_case("once") {
+        return Ok(PermissionScope::Once);
+    }
+    if spec.eq_ignore_ascii_case("session") {
+        return Ok(PermissionScope::Session);
+    }
+    if spec.eq_ignore_ascii_case("forever") || spec.eq_ignore_ascii_case("persistent") {
+        return Ok(PermissionScope::Forever);
+    }
+    if let Some(rest) = spec.strip_prefix("project") {
+        let name = rest
+            .strip_prefix(':')
+            .map(str::to_string)
+            .or_else(|| active_project.map(str::to_string));
+        return match name {
+            Some(name) if !name.is_empty() => Ok(PermissionScope::Project { name }),
+            _ => Err("project scope requires a name (no active project). Use `project:NAME`.".to_string()),
+        };
+    }
+    Err(format!(
+        "Unknown scope '{}'. Use: once | session | forever | project[:NAME]",
+        spec
+    ))
+}
+
+/// Parse a subject spec into `PermissionSubject`. Grammar:
+///
+/// - `tool:NAME`
+/// - `tool-input:NAME[:CONTAINS_SUBSTR]`
+/// - `path:/abs/path[:read|write|any]`     (default `any`)
+/// - `url:GLOB_PATTERN`
+/// - `cmd:bash|powershell|any:GLOB_PATTERN`
+fn parse_permission_subject_spec(
+    spec: &str,
+) -> Result<claurst_core::permissions::PermissionSubject, String> {
+    use claurst_core::permissions::{
+        CommandPattern, InputMatcher, PathMode, PermissionSubject, Shell, UrlPattern,
+    };
+    if let Some(rest) = spec.strip_prefix("tool:") {
+        if rest.is_empty() {
+            return Err("tool:NAME — name missing".to_string());
+        }
+        return Ok(PermissionSubject::Tool { name: rest.to_string() });
+    }
+    if let Some(rest) = spec.strip_prefix("tool-input:") {
+        let mut parts = rest.splitn(2, ':');
+        let name = parts.next().unwrap_or("");
+        if name.is_empty() {
+            return Err("tool-input:NAME[:CONTAINS] — name missing".to_string());
+        }
+        let input_match = match parts.next() {
+            None | Some("") => InputMatcher::Any,
+            Some(needle) => InputMatcher::Contains(needle.to_string()),
+        };
+        return Ok(PermissionSubject::ToolInput {
+            name: name.to_string(),
+            input_match,
+        });
+    }
+    if let Some(rest) = spec.strip_prefix("path:") {
+        // Path can contain a colon on Windows; greedy split on the LAST colon
+        // only when the suffix is a known mode keyword.
+        let (path_str, mode) = if let Some((p, m)) = rest.rsplit_once(':') {
+            let mode = match m.to_ascii_lowercase().as_str() {
+                "read" => Some(PathMode::Read),
+                "write" => Some(PathMode::Write),
+                "any" => Some(PathMode::Any),
+                _ => None,
+            };
+            match mode {
+                Some(m) => (p, m),
+                None => (rest, PathMode::Any),
+            }
+        } else {
+            (rest, PathMode::Any)
+        };
+        if path_str.is_empty() {
+            return Err("path:PATH[:read|write|any] — path missing".to_string());
+        }
+        return Ok(PermissionSubject::Path {
+            path: std::path::PathBuf::from(path_str),
+            mode,
+        });
+    }
+    if let Some(rest) = spec.strip_prefix("url:") {
+        if rest.is_empty() {
+            return Err("url:PATTERN — pattern missing".to_string());
+        }
+        return Ok(PermissionSubject::Url {
+            pattern: UrlPattern(rest.to_string()),
+        });
+    }
+    if let Some(rest) = spec.strip_prefix("cmd:") {
+        let (shell_str, pattern) = rest
+            .split_once(':')
+            .ok_or_else(|| "cmd:SHELL:PATTERN — missing pattern".to_string())?;
+        let shell = match shell_str.to_ascii_lowercase().as_str() {
+            "bash" => Shell::Bash,
+            "powershell" | "ps" => Shell::Powershell,
+            "any" => Shell::Any,
+            other => return Err(format!("Unknown shell '{}'. Use: bash | powershell | any", other)),
+        };
+        if pattern.is_empty() {
+            return Err("cmd:SHELL:PATTERN — pattern missing".to_string());
+        }
+        return Ok(PermissionSubject::Command {
+            shell,
+            pattern: CommandPattern(pattern.to_string()),
+        });
+    }
+    Err(format!(
+        "Unknown subject '{}'. Try: tool:NAME | tool-input:NAME[:CONTAINS] | path:PATH[:read|write|any] | url:PATTERN | cmd:SHELL:PATTERN",
+        spec
+    ))
+}
+
 #[async_trait]
 impl SlashCommand for PermissionsCommand {
     fn name(&self) -> &str { "permissions" }
     fn description(&self) -> &str { "View or change tool permission settings" }
     fn help(&self) -> &str {
-        "Usage: /permissions [set <mode>|allow <tool>|deny <tool>|reset]\n\n\
+        "Usage: /permissions [set <mode>|allow <tool>|deny <tool>|reset|list|revoke <id>|grant <subject> <scope> [allow|deny]]\n\n\
          Modes: default, accept-edits, bypass-permissions, plan\n\n\
+         Subject grammar:\n\
+           tool:NAME                            — match by tool name\n\
+           tool-input:NAME[:CONTAINS]           — tool name + optional input substring\n\
+           path:PATH[:read|write|any]           — filesystem path with mode (default any)\n\
+           url:GLOB                             — outbound URL glob\n\
+           cmd:bash|powershell|any:GLOB         — shell command pattern\n\n\
+         Scope grammar:\n\
+           once | session | forever | project[:NAME]\n\n\
          Examples:\n\
-           /permissions                    — show current permissions\n\
-           /permissions set accept-edits   — auto-accept file edits\n\
-           /permissions allow Bash         — allow a specific tool\n\
-           /permissions deny Write         — deny a specific tool\n\
-           /permissions reset              — clear overrides"
+           /permissions                                       — show current permissions\n\
+           /permissions set accept-edits                      — auto-accept file edits\n\
+           /permissions allow Bash                            — allow a specific tool (settings shorthand)\n\
+           /permissions deny Write                            — deny a specific tool (settings shorthand)\n\
+           /permissions list                                  — list all rules with stable ids\n\
+           /permissions revoke <id>                           — remove rule by id (from list)\n\
+           /permissions grant tool:Bash session               — Allow Bash for this session\n\
+           /permissions grant cmd:bash:*git* forever          — Allow any bash git command persistently\n\
+           /permissions grant url:https://api.example.com/* project deny  — Deny URL in active project"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -3484,8 +3639,188 @@ impl SlashCommand for PermissionsCommand {
                     "Permissions reset to defaults.".to_string(),
                 )
             }
+            "list" => {
+                let Some(live) = ctx.live_session.as_ref() else {
+                    return CommandResult::Message(
+                        "Permission rules unavailable in this context (pre-session path).".to_string(),
+                    );
+                };
+                let rules = live.runtime.permissions.lock().list_rules();
+                if rules.is_empty() {
+                    return CommandResult::Message("No permission rules.".to_string());
+                }
+                let mut out = String::from("Permission rules\n────────────────\n");
+                for r in &rules {
+                    let subj = if let Some(s) = &r.subject {
+                        format!("{:?}", s)
+                    } else {
+                        format!(
+                            "tool={} path={}",
+                            r.tool_name.as_deref().unwrap_or("*"),
+                            r.path_pattern.as_deref().unwrap_or("*"),
+                        )
+                    };
+                    let scope = match &r.scope {
+                        claurst_core::permissions::PermissionScope::Once => "once".to_string(),
+                        claurst_core::permissions::PermissionScope::Session => "session".to_string(),
+                        claurst_core::permissions::PermissionScope::Forever => "forever".to_string(),
+                        claurst_core::permissions::PermissionScope::Project { name } => format!("project:{}", name),
+                    };
+                    out.push_str(&format!(
+                        "  {} [{:?}] scope={} {}\n",
+                        r.id, r.action, scope, subj
+                    ));
+                }
+                CommandResult::Message(out)
+            }
+            "revoke" => {
+                if arg.is_empty() {
+                    return CommandResult::Error("Usage: /permissions revoke <id>".to_string());
+                }
+                let id = match uuid::Uuid::parse_str(arg) {
+                    Ok(u) => u,
+                    Err(e) => return CommandResult::Error(format!("Invalid uuid: {}", e)),
+                };
+                let Some(live) = ctx.live_session.as_ref() else {
+                    return CommandResult::Error(
+                        "Permission rules unavailable in this context (pre-session path).".to_string(),
+                    );
+                };
+                let removed = {
+                    let mut settings_guard = live.settings.write();
+                    let mut perm_guard = live.runtime.permissions.lock();
+                    perm_guard.remove_rule_by_id(id, &mut *settings_guard)
+                };
+                match removed {
+                    Ok(Some(r)) => {
+                        // Project-scoped rules need a separate disk-mirror
+                        // pass since `remove_rule_by_id` only mirrors Forever
+                        // scope to settings.json.
+                        if let claurst_core::permissions::PermissionScope::Project {
+                            name,
+                        } = &r.scope
+                        {
+                            if let Err(e) = live.persist_remove_project_rule(name, r.id, None)
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    project = %name,
+                                    rule = %r.id,
+                                    "Failed to mirror project rule removal to disk",
+                                );
+                            }
+                        }
+                        CommandResult::Message(format!(
+                            "Revoked rule {} [{:?}] tool={}",
+                            r.id,
+                            r.action,
+                            r.tool_name.as_deref().unwrap_or("*"),
+                        ))
+                    }
+                    Ok(None) => CommandResult::Error(format!("No rule with id {}", id)),
+                    Err(e) => CommandResult::Error(format!("Failed to revoke: {}", e)),
+                }
+            }
+            "grant" => {
+                use claurst_core::permissions::{
+                    PermissionAction, PermissionRule, PermissionScope,
+                };
+                let Some(live) = ctx.live_session.as_ref() else {
+                    return CommandResult::Error(
+                        "Permission rules unavailable in this context (pre-session path).".to_string(),
+                    );
+                };
+                let tokens: Vec<&str> = arg.split_whitespace().collect();
+                if tokens.len() < 2 {
+                    return CommandResult::Error(
+                        "Usage: /permissions grant <subject> <scope> [allow|deny]".to_string(),
+                    );
+                }
+                let subject = match parse_permission_subject_spec(tokens[0]) {
+                    Ok(s) => s,
+                    Err(e) => return CommandResult::Error(e),
+                };
+                let active_project = live.active_project_name();
+                let scope = match parse_permission_scope_spec(tokens[1], active_project.as_deref()) {
+                    Ok(s) => s,
+                    Err(e) => return CommandResult::Error(e),
+                };
+                let action = match tokens.get(2).map(|s| s.to_ascii_lowercase()).as_deref() {
+                    None | Some("allow") => PermissionAction::Allow,
+                    Some("deny") => PermissionAction::Deny,
+                    Some(other) => {
+                        return CommandResult::Error(format!(
+                            "Unknown action '{}'. Use: allow | deny",
+                            other
+                        ));
+                    }
+                };
+                // Once-scoped grants do nothing — the manager doesn't track them.
+                if matches!(scope, PermissionScope::Once) {
+                    return CommandResult::Message(
+                        "Once-scoped rules are resolved inline by tool dispatch and never tracked. Use session/project/forever for persistent grants.".to_string(),
+                    );
+                }
+                let rule = PermissionRule {
+                    id: uuid::Uuid::new_v4(),
+                    tool_name: None,
+                    path_pattern: None,
+                    action: action.clone(),
+                    scope: scope.clone(),
+                    subject: Some(subject),
+                    created_at: chrono::Utc::now(),
+                };
+                let rule_id = rule.id;
+                let rule_for_disk = rule.clone();
+                {
+                    let mut perm_guard = live.runtime.permissions.lock();
+                    perm_guard.add_rule(rule);
+                }
+                // Persist by scope:
+                //   Forever  → settings.json (full fidelity now that
+                //              SerializedPermissionRule carries id + subject).
+                //   Project  → ~/.claurst/projects/<name>.json via
+                //              LiveSession::persist_project_rule.
+                //   Session  → in-memory only.
+                match &scope {
+                    PermissionScope::Forever => {
+                        use claurst_core::permissions::SerializedPermissionRule;
+                        let mut settings_guard = live.settings.write();
+                        settings_guard
+                            .permission_rules
+                            .push(SerializedPermissionRule::from(&rule_for_disk));
+                        if let Err(e) = settings_guard.save_sync() {
+                            return CommandResult::Error(format!(
+                                "Rule added in-memory but settings save failed: {}",
+                                e
+                            ));
+                        }
+                    }
+                    PermissionScope::Project { name } => {
+                        if let Err(e) =
+                            live.persist_project_rule(name, &rule_for_disk, None)
+                        {
+                            return CommandResult::Error(format!(
+                                "Rule added in-memory but project save failed: {}",
+                                e
+                            ));
+                        }
+                    }
+                    PermissionScope::Session | PermissionScope::Once => {}
+                }
+                CommandResult::Message(format!(
+                    "Granted rule {} [scope={}].",
+                    rule_id,
+                    match scope {
+                        PermissionScope::Once => "once".to_string(),
+                        PermissionScope::Session => "session".to_string(),
+                        PermissionScope::Forever => "forever".to_string(),
+                        PermissionScope::Project { name } => format!("project:{}", name),
+                    }
+                ))
+            }
             other => CommandResult::Error(format!(
-                "Unknown subcommand '{}'. Use: /permissions [set|allow|deny|reset]",
+                "Unknown subcommand '{}'. Use: /permissions [set|allow|deny|reset|list|revoke|grant]",
                 other
             )),
         }
@@ -3532,11 +3867,400 @@ impl SlashCommand for TasksCommand {
     fn name(&self) -> &str { "tasks" }
     fn aliases(&self) -> Vec<&str> { vec!["bashes"] }
     fn description(&self) -> &str { "List and manage background tasks" }
+    fn help(&self) -> &str {
+        "Usage: /tasks [show <id> | cancel <id>]\n\n\
+         No args    — list every tracked background task (agent runs, cron ticks, sub-agents, etc.).\n\
+         show <id>  — print full details for one task.\n\
+         cancel <id>— signal graceful cancel via the task's CancellationToken."
+    }
 
-    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        CommandResult::UserMessage(
-            "Please list all current tasks using the TaskList tool and show their status.".to_string()
-        )
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let Some(tracker) = ctx.task_tracker.as_ref() else {
+            return CommandResult::Message(
+                "Task tracker unavailable in this context (pre-session path).".to_string(),
+            );
+        };
+        let args = args.trim();
+        let mut parts = args.splitn(2, char::is_whitespace);
+        match (parts.next().unwrap_or(""), parts.next().map(str::trim).unwrap_or("")) {
+            ("" | "list", _) => {
+                let tasks = tracker.list_active();
+                if tasks.is_empty() {
+                    return CommandResult::Message("No active tasks.".to_string());
+                }
+                let now = chrono::Utc::now();
+                let mut out = String::from("Active tasks\n────────────\n");
+                for t in &tasks {
+                    let age = now.signed_duration_since(t.started_at());
+                    let age_s = age.num_seconds().max(0);
+                    let age_str = if age_s < 60 {
+                        format!("{}s", age_s)
+                    } else if age_s < 3600 {
+                        format!("{}m", age_s / 60)
+                    } else {
+                        format!("{}h", age_s / 3600)
+                    };
+                    let status = match t.status() {
+                        claurst_core::task_tracker::TaskStatus::Running => "running".to_string(),
+                        claurst_core::task_tracker::TaskStatus::Waiting { reason } => format!("waiting:{}", reason),
+                        claurst_core::task_tracker::TaskStatus::Completed => "completed".to_string(),
+                        claurst_core::task_tracker::TaskStatus::Failed { error } => format!("failed:{}", error.chars().take(40).collect::<String>()),
+                        claurst_core::task_tracker::TaskStatus::Cancelled => "cancelled".to_string(),
+                    };
+                    out.push_str(&format!(
+                        "  {id:<22} {kind:<9} {age:>5}  {status:<16} {summary}\n",
+                        id = t.id().chars().take(22).collect::<String>(),
+                        kind = format!("{:?}", t.kind()),
+                        age = age_str,
+                        status = status,
+                        summary = t.summary(),
+                    ));
+                }
+                out.push_str(&format!("\n{} task(s). Use /tasks show <id> or /tasks cancel <id>.", tasks.len()));
+                CommandResult::Message(out)
+            }
+            ("show", id) if !id.is_empty() => match tracker.get(id) {
+                Some(t) => {
+                    let out = format!(
+                        "Task {}\n────────\nKind: {:?}\nSource: {:?}\nStarted: {}\nStatus: {:?}\nSummary: {}\n\n{}",
+                        t.id(),
+                        t.kind(),
+                        t.source(),
+                        t.started_at().format("%Y-%m-%d %H:%M:%S UTC"),
+                        t.status(),
+                        t.summary(),
+                        t.details(),
+                    );
+                    CommandResult::Message(out)
+                }
+                None => CommandResult::Error(format!("No task with id '{}'.", id)),
+            },
+            ("cancel", id) if !id.is_empty() => match tracker.cancel(id) {
+                Some(t) => CommandResult::Message(format!(
+                    "Cancel signalled for task {} ({}).",
+                    t.id(),
+                    t.summary()
+                )),
+                None => CommandResult::Error(format!("No task with id '{}'.", id)),
+            },
+            ("show" | "cancel", _) => {
+                CommandResult::Error("Missing task id. Usage: /tasks show <id> | cancel <id>".to_string())
+            }
+            (other, _) => CommandResult::Error(format!(
+                "Unknown subcommand '{}'. Try /tasks, /tasks show <id>, /tasks cancel <id>.",
+                other
+            )),
+        }
+    }
+}
+
+// ---- /stop ---------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for StopCommand {
+    fn name(&self) -> &str { "stop" }
+    fn description(&self) -> &str { "Cancel background tasks" }
+    fn help(&self) -> &str {
+        "Usage: /stop all [--yes]\n\n\
+         Cancels every currently-tracked background task — agent runs, cron ticks, sub-agents.\n\
+         Use /tasks cancel <id> to cancel a single task.\n\
+         --yes skips the confirmation message when >0 tasks are running."
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let Some(tracker) = ctx.task_tracker.as_ref() else {
+            return CommandResult::Message(
+                "Task tracker unavailable in this context (pre-session path).".to_string(),
+            );
+        };
+        let args = args.trim();
+        let (target, flags) = args
+            .split_once(char::is_whitespace)
+            .map(|(t, f)| (t, f.trim()))
+            .unwrap_or((args, ""));
+        if target != "all" {
+            return CommandResult::Error(
+                "Usage: /stop all [--yes]. Use /tasks cancel <id> for a single task.".to_string(),
+            );
+        }
+        let confirm = flags.split_whitespace().any(|f| f == "--yes" || f == "-y");
+        let n = tracker.len();
+        if n == 0 {
+            return CommandResult::Message("No active tasks to stop.".to_string());
+        }
+        if !confirm {
+            return CommandResult::Message(format!(
+                "{} active task(s). Run `/stop all --yes` to cancel them all.",
+                n
+            ));
+        }
+        let cancelled = tracker.cancel_all();
+        CommandResult::Message(format!(
+            "Cancel signalled for {} task(s). Terminal status reported by /tasks once they drain.",
+            cancelled
+        ))
+    }
+}
+
+// ---- /activity -----------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for ActivityCommand {
+    fn name(&self) -> &str { "activity" }
+    fn description(&self) -> &str { "Open the event-log activity modal (or print recent events headless)" }
+    fn help(&self) -> &str {
+        "Usage:\n\
+           /activity                         — open scrollable modal in the TUI\n\
+           /activity tail [N] [--source <k>] — text dump of the most-recent N events (default 20)\n\n\
+         Modal keys: j/k scroll, PgUp/PgDn page, g/G jump, f filter, d details, Esc/q close.\n\
+         --source filter accepts: main | cron | proactive | agent | bgloop | system | slash.\n\
+         The ring is flushed to ~/.claurst/event_log.jsonl on graceful exit."
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let Some(log) = ctx.event_log.as_ref() else {
+            return CommandResult::Message(
+                "Event log unavailable in this context (pre-session path).".to_string(),
+            );
+        };
+
+        // Default form (no `tail` subcommand) opens the modal. Headless / pre-
+        // session callers fall back to the text dump.
+        let trimmed = args.trim();
+        if !trimmed.starts_with("tail") {
+            // Fast-path: when no args at all, open the modal.
+            if trimmed.is_empty() {
+                return CommandResult::OpenActivityOverlay;
+            }
+            // If args were given without `tail`, treat them as legacy text-form
+            // arguments (back-compat with the prior implementation). Continue
+            // through to the renderer below.
+        }
+        // Strip the optional `tail` keyword for the text path.
+        let args = trimmed.strip_prefix("tail").unwrap_or(trimmed).trim_start();
+
+        // Parse: [N] [--source kind]
+        let mut limit: usize = 20;
+        let mut source_filter: Option<String> = None;
+        let mut parts = args.split_whitespace();
+        while let Some(tok) = parts.next() {
+            match tok {
+                "--source" | "-s" => {
+                    source_filter = parts.next().map(|s| s.to_ascii_lowercase());
+                }
+                other => {
+                    if let Ok(n) = other.parse::<usize>() {
+                        limit = n.clamp(1, 500);
+                    }
+                }
+            }
+        }
+
+        let matches_source = |s: &claurst_core::permissions::TaskSource, want: &str| -> bool {
+            use claurst_core::permissions::TaskSource as T;
+            match (want, s) {
+                ("main", T::MainSession) => true,
+                ("cron", T::Cron(_)) => true,
+                ("proactive", T::Proactive) => true,
+                ("agent", T::Agent(_)) => true,
+                ("bgloop" | "bg", T::BgLoop(_)) => true,
+                ("slash", T::SlashCommand(_)) => true,
+                ("system", T::System) => true,
+                _ => false,
+            }
+        };
+
+        let events: Vec<claurst_core::event_log::Event> = match source_filter.as_deref() {
+            Some(want) => log.filter_by_source(|s| matches_source(s, want)),
+            None => log.snapshot(),
+        };
+
+        if events.is_empty() {
+            return CommandResult::Message("No events recorded.".to_string());
+        }
+
+        let start = events.len().saturating_sub(limit);
+        let slice = &events[start..];
+        let mut out = format!(
+            "Activity (showing {} of {})\n──────────────\n",
+            slice.len(),
+            events.len()
+        );
+        for e in slice {
+            let icon = match &e.kind {
+                claurst_core::event_log::EventKind::TurnStart => "▶",
+                claurst_core::event_log::EventKind::TurnEnd => "◼",
+                claurst_core::event_log::EventKind::ToolCall { .. } => "⚙",
+                claurst_core::event_log::EventKind::BackgroundStart => "→",
+                claurst_core::event_log::EventKind::BackgroundFinish { is_error } => {
+                    if *is_error { "✗" } else { "✓" }
+                }
+                claurst_core::event_log::EventKind::PermissionRequested => "?",
+                claurst_core::event_log::EventKind::PermissionDecided(_) => "!",
+                claurst_core::event_log::EventKind::CronFired { .. } => "⏰",
+                claurst_core::event_log::EventKind::AgentSpawned { .. } => "+",
+                claurst_core::event_log::EventKind::ConfigChanged { .. } => "∆",
+                claurst_core::event_log::EventKind::TaskPanicked { .. } => "☠",
+                claurst_core::event_log::EventKind::SnapshotPartialLoad { .. } => "⚠",
+                claurst_core::event_log::EventKind::Error(_) => "✗",
+                claurst_core::event_log::EventKind::Info(_) => "ℹ",
+            };
+            let src_label = match &e.source {
+                claurst_core::permissions::TaskSource::MainSession => "main".to_string(),
+                claurst_core::permissions::TaskSource::SlashCommand(n) => format!("/{}", n),
+                claurst_core::permissions::TaskSource::Cron(id) => format!("cron:{}", id),
+                claurst_core::permissions::TaskSource::Proactive => "proactive".to_string(),
+                claurst_core::permissions::TaskSource::Agent(n) => format!("agent:{}", n),
+                claurst_core::permissions::TaskSource::BgLoop(n) => format!("bg:{}", n),
+                claurst_core::permissions::TaskSource::System => "system".to_string(),
+            };
+            out.push_str(&format!(
+                "  {} {} {:<14} {}\n",
+                e.at.format("%H:%M:%S"),
+                icon,
+                src_label.chars().take(14).collect::<String>(),
+                e.summary
+            ));
+        }
+        CommandResult::Message(out)
+    }
+}
+
+// ---- /project ------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for ProjectCommand {
+    fn name(&self) -> &str { "project" }
+    fn description(&self) -> &str { "Manage registered projects" }
+    fn help(&self) -> &str {
+        "Usage: /project [list | show | switch <name> | create <name> --root <path>]\n\n\
+         list               — list registered projects + mark the active one.\n\
+         show               — print details about the active project.\n\
+         switch <name>      — swap cwd + active project. In-flight tasks keep their old scope.\n\
+         create <name> --root <path>\n\
+                            — register a new project rooted at <path>. Persists to ~/.claurst/projects/<name>.json."
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let Some(live) = ctx.live_session.as_ref() else {
+            return CommandResult::Message(
+                "Live session unavailable in this context (pre-session path).".to_string(),
+            );
+        };
+        let args = args.trim();
+        let mut parts = args.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let rest = parts.next().map(str::trim).unwrap_or("");
+
+        match sub.as_str() {
+            "" | "list" => {
+                let registry = live.runtime.project_registry.read();
+                let active = live.active_project_name();
+                if registry.is_empty() {
+                    return CommandResult::Message(
+                        "No registered projects. Create one with `/project create <name> --root <path>`.".to_string(),
+                    );
+                }
+                let mut out = String::from("Projects\n────────\n");
+                for (name, cfg) in registry.iter() {
+                    let marker = if active.as_deref() == Some(name) { "* " } else { "  " };
+                    out.push_str(&format!("{}{:<24} {}\n", marker, name, cfg.root_path.display()));
+                }
+                if active.is_none() {
+                    out.push_str("\n(no active project — using live cwd)");
+                }
+                CommandResult::Message(out)
+            }
+            "show" => {
+                let Some(name) = live.active_project_name() else {
+                    return CommandResult::Message(
+                        "No active project. Use `/project switch <name>` to activate one.".to_string(),
+                    );
+                };
+                match live.lookup_project(&name) {
+                    Some(cfg) => {
+                        let mut out = format!(
+                            "Project {}\n────────\nRoot: {}\nDefault agent: {}\nPermission rules: {}\nMCP servers: {}\n",
+                            cfg.name,
+                            cfg.root_path.display(),
+                            cfg.default_agent.as_deref().unwrap_or("(none)"),
+                            cfg.permission_rules.len(),
+                            cfg.mcp_servers.len(),
+                        );
+                        if !cfg.mcp_servers.is_empty() {
+                            out.push_str("\nMCP servers:\n");
+                            for (name, _) in cfg.mcp_servers.iter() {
+                                out.push_str(&format!("  - {}\n", name));
+                            }
+                        }
+                        CommandResult::Message(out)
+                    }
+                    None => CommandResult::Error(format!(
+                        "Active project '{}' missing from registry on disk.",
+                        name
+                    )),
+                }
+            }
+            "switch" => {
+                if rest.is_empty() {
+                    return CommandResult::Error("Usage: /project switch <name>".to_string());
+                }
+                match live.switch_project(rest) {
+                    Ok(()) => CommandResult::Message(format!("Switched to project '{}'.", rest)),
+                    Err(name) => CommandResult::Error(format!(
+                        "No project '{}' registered. Use `/project list` to see available.",
+                        name
+                    )),
+                }
+            }
+            "create" => {
+                // Syntax: create <name> --root <path>
+                let mut name: Option<String> = None;
+                let mut root: Option<std::path::PathBuf> = None;
+                let mut toks = rest.split_whitespace();
+                while let Some(tok) = toks.next() {
+                    match tok {
+                        "--root" | "-r" => {
+                            root = toks.next().map(std::path::PathBuf::from);
+                        }
+                        other if name.is_none() => name = Some(other.to_string()),
+                        _ => {}
+                    }
+                }
+                let (Some(name), Some(root)) = (name, root) else {
+                    return CommandResult::Error(
+                        "Usage: /project create <name> --root <path>".to_string(),
+                    );
+                };
+                if !root.exists() {
+                    return CommandResult::Error(format!(
+                        "Root path does not exist: {}",
+                        root.display()
+                    ));
+                }
+                let cfg = claurst_core::project_registry::ProjectConfig::new(name.clone(), root);
+                // Insert into registry + persist next to others on disk.
+                live.runtime.project_registry.write().insert(cfg.clone());
+                let dir = claurst_core::project_registry::default_projects_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from(".claurst/projects"));
+                match claurst_core::project_registry::ProjectRegistry::save_one(&dir, &cfg) {
+                    Ok(()) => CommandResult::Message(format!(
+                        "Registered project '{}' at {}. Use `/project switch {}` to activate.",
+                        name,
+                        cfg.root_path.display(),
+                        name
+                    )),
+                    Err(e) => CommandResult::Error(format!(
+                        "Project '{}' registered in-memory, but disk write failed: {}",
+                        name, e
+                    )),
+                }
+            }
+            other => CommandResult::Error(format!(
+                "Unknown /project subcommand '{}'. Try list, show, switch, create.",
+                other
+            )),
+        }
     }
 }
 
@@ -6701,6 +7425,8 @@ impl SlashCommand for TeleportCommand {
                             tool_name: Some(name.clone()),
                             path_pattern: None,
                             action: PermissionAction::Allow,
+                            id: None,
+                            subject: None,
                         });
                     }
                     for name in &denied {
@@ -6708,6 +7434,8 @@ impl SlashCommand for TeleportCommand {
                             tool_name: Some(name.clone()),
                             path_pattern: None,
                             action: PermissionAction::Deny,
+                            id: None,
+                            subject: None,
                         });
                     }
                     TeleportPermissions { allowed, denied, rules }
@@ -6857,6 +7585,8 @@ impl SlashCommand for TeleportCommand {
                             tool_name: Some(name.clone()),
                             path_pattern: None,
                             action: PermissionAction::Allow,
+                            id: None,
+                            subject: None,
                         });
                     }
                     for name in &denied {
@@ -6864,6 +7594,8 @@ impl SlashCommand for TeleportCommand {
                             tool_name: Some(name.clone()),
                             path_pattern: None,
                             action: PermissionAction::Deny,
+                            id: None,
+                            subject: None,
                         });
                     }
                     TeleportPermissions { allowed, denied, rules }
@@ -7589,75 +8321,328 @@ impl SlashCommand for ConnectCommand {
 
 // ---- /agent ---------------------------------------------------------------
 
+fn render_agent_details(name: &str, def: &claurst_core::AgentConfig, origin: &str) -> String {
+    let mut output = format!("Agent: @{}  ({})\n", name, origin);
+    if let Some(ref desc) = def.description {
+        output.push_str(&format!("Description: {}\n", desc));
+    }
+    output.push_str(&format!("Access: {}\n", def.access));
+    if let Some(ref model) = def.model {
+        output.push_str(&format!("Model: {}\n", model));
+    }
+    if let Some(t) = def.max_turns {
+        output.push_str(&format!("Max turns: {}\n", t));
+    }
+    if let Some(ref color) = def.color {
+        output.push_str(&format!("Color: {}\n", color));
+    }
+    if let Some(ref project) = def.project {
+        output.push_str(&format!("Project: {}\n", project));
+    }
+    if def.kairos_addendum {
+        output.push_str("Kairos addendum: yes\n");
+    }
+    if let Some(p) = def.kairos_policy {
+        output.push_str(&format!("Kairos policy: {:?}\n", p));
+    }
+    if let Some(ref prompt) = def.append_system_prompt {
+        output.push_str(&format!("\nSystem prompt suffix:\n  {}\n", prompt));
+    }
+    if let Some(ref prompt) = def.system_prompt {
+        output.push_str(&format!("\nSystem prompt override:\n  {}\n", prompt));
+    }
+    output
+}
+
+fn agent_origin(live: &claurst_core::live_session::LiveSession, name: &str) -> &'static str {
+    if live.ephemeral.read().agents.contains_key(name) {
+        "ephemeral"
+    } else if live.settings.read().agents.contains_key(name) {
+        "settings"
+    } else {
+        "builtin"
+    }
+}
+
 #[async_trait]
 impl SlashCommand for AgentCommand {
     fn name(&self) -> &str { "agent" }
-    fn description(&self) -> &str { "List available agents or get info about a specific agent" }
+    fn description(&self) -> &str { "List, inspect, or manage named agents (Phase 11)" }
     fn help(&self) -> &str {
-        "Usage: /agent [name]\n\nWithout arguments, lists all available named agents.\nWith a name, shows details for that agent.\n\nTo use an agent, start Claurst with: --agent <name>"
+        "Usage:\n\
+           /agent [list]                  — list all agents (settings + ephemeral)\n\
+           /agent show <name>             — show details for a named agent\n\
+           /agent create <name>           — create a scratch agent in EphemeralState from current resolved config\n\
+           /agent delete <name>           — remove an agent (ephemeral first, then settings)\n\
+           /agent persist <name>          — promote an ephemeral agent into Settings.agents (saves to disk)\n\
+           /agent run <name> <prompt>     — spawn the agent in the background with this prompt\n\
+           /agent <name>                  — short form of `/agent show <name>`\n\
+           /agent <name> <prompt>         — short form of `/agent run <name> <prompt>` (when name is a known agent)\n\n\
+         Round 2 routes through LiveSession when present; falls back to Settings.agents otherwise."
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         use std::collections::HashMap;
 
-        // Merge built-in defaults with user-defined agents (user wins on collision).
-        let mut all_agents: HashMap<String, claurst_core::AgentDefinition> =
-            claurst_core::default_agents();
-        all_agents.extend(ctx.config.agents.clone());
+        let args = args.trim();
+        let mut parts = args.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").trim();
+        let rest = parts.next().map(str::trim).unwrap_or("");
 
-        let agent_name = args.trim();
+        // ---- list (default) ----------------------------------------------
+        if sub.is_empty() || sub == "list" {
+            // Merge built-ins + settings + ephemeral (when present).
+            let mut all_agents: HashMap<String, claurst_core::AgentConfig> =
+                claurst_core::default_agents();
+            all_agents.extend(ctx.config.agents.clone());
 
-        if agent_name.is_empty() {
-            // List all visible agents.
-            let mut keys: Vec<&String> = all_agents
+            let mut origins: HashMap<String, &'static str> = HashMap::new();
+            for k in claurst_core::default_agents().keys() {
+                origins.insert(k.clone(), "builtin");
+            }
+            for k in ctx.config.agents.keys() {
+                origins.insert(k.clone(), "settings");
+            }
+
+            if let Some(live) = ctx.live_session.as_ref() {
+                let eph = live.ephemeral.read();
+                for (k, v) in eph.agents.iter() {
+                    all_agents.insert(k.clone(), v.clone());
+                    origins.insert(k.clone(), "ephemeral");
+                }
+            }
+
+            let mut keys: Vec<String> = all_agents
                 .iter()
                 .filter(|(_, d)| d.visible)
-                .map(|(k, _)| k)
+                .map(|(k, _)| k.clone())
                 .collect();
             keys.sort();
 
             let mut output = "Available agents:\n\n".to_string();
-            for name in keys {
+            for name in &keys {
                 let def = &all_agents[name];
+                let origin = origins.get(name).copied().unwrap_or("?");
                 output.push_str(&format!(
-                    "  @{} — {}\n    access: {}{}\n",
+                    "  @{:<22} [{}] — {}{}{}\n",
                     name,
+                    origin,
                     def.description.as_deref().unwrap_or(""),
-                    def.access,
+                    def.model
+                        .as_deref()
+                        .map(|m| format!("  model={}", m))
+                        .unwrap_or_default(),
                     def.max_turns
-                        .map(|t| format!(", max_turns: {}", t))
+                        .map(|t| format!("  max_turns={}", t))
                         .unwrap_or_default(),
                 ));
             }
-            output.push_str("\nUse --agent <name> when starting Claurst to activate an agent.");
-            CommandResult::Message(output)
-        } else if let Some(def) = all_agents.get(agent_name) {
-            // Show details for the named agent.
-            let mut output = format!("Agent: @{}\n", agent_name);
-            if let Some(ref desc) = def.description {
-                output.push_str(&format!("Description: {}\n", desc));
+            output.push_str("\nUse `/agent show <name>` for details, `/agent create <name>` to scratch one, `/agent persist <name>` to promote ephemeral → settings.");
+            return CommandResult::Message(output);
+        }
+
+        // ---- create ------------------------------------------------------
+        if sub == "create" {
+            let name = rest;
+            if name.is_empty() {
+                return CommandResult::Error("Usage: /agent create <name>".to_string());
             }
-            output.push_str(&format!("Access: {}\n", def.access));
-            if let Some(ref model) = def.model {
-                output.push_str(&format!("Model: {}\n", model));
+            let Some(live) = ctx.live_session.as_ref() else {
+                return CommandResult::Error(
+                    "Agent management unavailable in this context (pre-session path).".to_string(),
+                );
+            };
+            if live.agent_exists(name) {
+                return CommandResult::Error(format!(
+                    "Agent '{}' already exists. Delete it first or pick another name.",
+                    name
+                ));
             }
-            if let Some(t) = def.max_turns {
-                output.push_str(&format!("Max turns: {}\n", t));
+            // Seed from the currently-resolved live config so the new agent
+            // inherits ephemeral overrides (model, etc.). Description is set
+            // to a placeholder the user can edit by writing settings later.
+            let mut cfg = live.resolve_agent_config(None);
+            if cfg.description.is_none() {
+                cfg.description = Some(format!("scratch agent: {}", name));
             }
-            if let Some(ref color) = def.color {
-                output.push_str(&format!("Color: {}\n", color));
-            }
-            if let Some(ref prompt) = def.append_system_prompt {
-                output.push_str(&format!("\nSystem prompt prefix:\n  {}\n", prompt));
-            }
-            output.push_str(&format!(
-                "\nTo activate: claude --agent {}", agent_name
+            live.put_ephemeral_agent(name, cfg);
+            return CommandResult::Message(format!(
+                "Created ephemeral agent '{}'. Use `/agent persist {}` to save it to settings.",
+                name, name
             ));
-            CommandResult::Message(output)
+        }
+
+        // ---- delete ------------------------------------------------------
+        if sub == "delete" {
+            let name = rest;
+            if name.is_empty() {
+                return CommandResult::Error("Usage: /agent delete <name>".to_string());
+            }
+            let Some(live) = ctx.live_session.as_ref() else {
+                return CommandResult::Error(
+                    "Agent management unavailable in this context (pre-session path).".to_string(),
+                );
+            };
+            // Track origin before deletion so we know whether to also persist
+            // settings.json (only when removing a persisted entry).
+            let was_settings = live.settings.read().agents.contains_key(name);
+            let was_ephemeral = live.ephemeral.read().agents.contains_key(name);
+            match live.delete_agent(name) {
+                Some(_) => {
+                    if was_settings && !was_ephemeral {
+                        let name_owned = name.to_string();
+                        if let Err(e) = save_settings_mutation(move |s| {
+                            s.agents.remove(&name_owned);
+                        }) {
+                            return CommandResult::Error(format!(
+                                "Removed in-memory but failed to persist settings: {}",
+                                e
+                            ));
+                        }
+                    }
+                    let scope = if was_ephemeral { "ephemeral" } else { "settings" };
+                    CommandResult::Message(format!("Deleted agent '{}' ({}).", name, scope))
+                }
+                None => CommandResult::Error(format!("No agent named '{}'.", name)),
+            }
+        // ---- persist -----------------------------------------------------
+        } else if sub == "persist" {
+            let name = rest;
+            if name.is_empty() {
+                return CommandResult::Error("Usage: /agent persist <name>".to_string());
+            }
+            let Some(live) = ctx.live_session.as_ref() else {
+                return CommandResult::Error(
+                    "Agent management unavailable in this context (pre-session path).".to_string(),
+                );
+            };
+            match live.promote_ephemeral_agent(name) {
+                Ok(_) => {
+                    // Mirror to disk so the promotion survives restart. Read the
+                    // promoted entry back from live.settings to keep the on-disk
+                    // copy aligned with what's in memory.
+                    let cfg = live.settings.read().agents.get(name).cloned();
+                    let name_owned = name.to_string();
+                    if let Some(cfg) = cfg {
+                        if let Err(e) = save_settings_mutation(move |s| {
+                            s.agents.insert(name_owned.clone(), cfg);
+                        }) {
+                            return CommandResult::Error(format!(
+                                "Promoted in-memory but failed to persist settings: {}",
+                                e
+                            ));
+                        }
+                    }
+                    CommandResult::Message(format!(
+                        "Promoted '{}' to Settings.agents (persisted to disk).",
+                        name
+                    ))
+                }
+                Err(e) => CommandResult::Error(e),
+            }
+        // ---- run (explicit spawn) ----------------------------------------
+        } else if sub == "run" {
+            let mut run_parts = rest.splitn(2, char::is_whitespace);
+            let name = run_parts.next().unwrap_or("").trim();
+            let prompt = run_parts.next().map(str::trim).unwrap_or("");
+            if name.is_empty() || prompt.is_empty() {
+                return CommandResult::Error(
+                    "Usage: /agent run <name> <prompt>".to_string(),
+                );
+            }
+            let Some(live) = ctx.live_session.as_ref() else {
+                return CommandResult::Error(
+                    "Agent spawn unavailable in this context (pre-session path).".to_string(),
+                );
+            };
+            if !live.agent_exists(name)
+                && !claurst_core::default_agents().contains_key(name)
+                && !ctx.config.agents.contains_key(name)
+            {
+                return CommandResult::Error(format!(
+                    "Unknown agent '{}'. Run /agent to see available agents.",
+                    name
+                ));
+            }
+            CommandResult::SpawnNamedAgent {
+                agent_name: name.to_string(),
+                prompt: prompt.to_string(),
+            }
+        // ---- show / bare lookup / sugar `<name> <prompt>` ----------------
+        } else if sub == "show" || matches!(sub, _ if !sub.is_empty()) {
+            // `/agent show <name>` → details only
+            // `/agent <name>`        → details (when no second token)
+            // `/agent <name> ...`    → spawn (when second token present and
+            //                          first token is a known agent — implicit
+            //                          run sugar)
+            if sub == "show" {
+                let name = rest;
+                if name.is_empty() {
+                    return CommandResult::Error(
+                        "Usage: /agent show <name>".to_string(),
+                    );
+                }
+                if let Some(live) = ctx.live_session.as_ref() {
+                    if live.agent_exists(name) {
+                        let cfg = live.resolve_agent_config(Some(name));
+                        let origin = agent_origin(live, name);
+                        return CommandResult::Message(render_agent_details(name, &cfg, origin));
+                    }
+                }
+                let mut all_agents: HashMap<String, claurst_core::AgentConfig> =
+                    claurst_core::default_agents();
+                all_agents.extend(ctx.config.agents.clone());
+                return if let Some(def) = all_agents.get(name) {
+                    CommandResult::Message(render_agent_details(name, def, "builtin/settings"))
+                } else {
+                    CommandResult::Error(format!(
+                        "Unknown agent '{}'. Run /agent to see available agents.",
+                        name
+                    ))
+                };
+            }
+
+            // sub is a candidate agent name. If `rest` is non-empty AND the
+            // candidate resolves to a real agent, treat as spawn sugar.
+            let candidate = sub;
+            let known_agent = ctx
+                .live_session
+                .as_ref()
+                .map(|l| l.agent_exists(candidate))
+                .unwrap_or(false)
+                || claurst_core::default_agents().contains_key(candidate)
+                || ctx.config.agents.contains_key(candidate);
+
+            if !rest.is_empty() && known_agent {
+                return CommandResult::SpawnNamedAgent {
+                    agent_name: candidate.to_string(),
+                    prompt: rest.to_string(),
+                };
+            }
+
+            // Fall through to show <candidate>.
+            if let Some(live) = ctx.live_session.as_ref() {
+                if live.agent_exists(candidate) {
+                    let cfg = live.resolve_agent_config(Some(candidate));
+                    let origin = agent_origin(live, candidate);
+                    return CommandResult::Message(render_agent_details(candidate, &cfg, origin));
+                }
+            }
+            let mut all_agents: HashMap<String, claurst_core::AgentConfig> =
+                claurst_core::default_agents();
+            all_agents.extend(ctx.config.agents.clone());
+            if let Some(def) = all_agents.get(candidate) {
+                CommandResult::Message(render_agent_details(candidate, def, "builtin/settings"))
+            } else {
+                CommandResult::Error(format!(
+                    "Unknown agent '{}'. Run /agent to see available agents.",
+                    candidate
+                ))
+            }
         } else {
             CommandResult::Error(format!(
-                "Unknown agent '{}'. Run /agent to see available agents.",
-                agent_name
+                "Unknown subcommand '{}'. Try /agent [list|show|create|delete|persist|run] [name].",
+                sub
             ))
         }
     }
@@ -8137,6 +9122,9 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(ManagedAgentsCommand),
         // Kairos mode diagnostics
         Box::new(KairosCommand),
+        Box::new(StopCommand),
+        Box::new(ActivityCommand),
+        Box::new(ProjectCommand),
     ]
 }
 
@@ -8444,6 +9432,8 @@ mod tests {
             remote_session_url: None,
             mcp_manager: None,
             live_session: None,
+            task_tracker: None,
+            event_log: None,
         }
     }
 
@@ -8631,5 +9621,235 @@ mod tests {
                 "second value".to_string(),
             ]
         );
+    }
+
+    // ---- /permissions grant subject + scope parsing -----------------------------
+
+    #[test]
+    fn parse_scope_keywords() {
+        use claurst_core::permissions::PermissionScope;
+        assert_eq!(
+            parse_permission_scope_spec("once", None).unwrap(),
+            PermissionScope::Once
+        );
+        assert_eq!(
+            parse_permission_scope_spec("session", None).unwrap(),
+            PermissionScope::Session
+        );
+        assert_eq!(
+            parse_permission_scope_spec("forever", None).unwrap(),
+            PermissionScope::Forever
+        );
+        assert_eq!(
+            parse_permission_scope_spec("Persistent", None).unwrap(),
+            PermissionScope::Forever
+        );
+    }
+
+    #[test]
+    fn parse_scope_project_with_explicit_name() {
+        use claurst_core::permissions::PermissionScope;
+        assert_eq!(
+            parse_permission_scope_spec("project:alpha", None).unwrap(),
+            PermissionScope::Project { name: "alpha".into() }
+        );
+    }
+
+    #[test]
+    fn parse_scope_project_falls_back_to_active() {
+        use claurst_core::permissions::PermissionScope;
+        assert_eq!(
+            parse_permission_scope_spec("project", Some("beta")).unwrap(),
+            PermissionScope::Project { name: "beta".into() }
+        );
+    }
+
+    #[test]
+    fn parse_scope_project_without_name_or_active_errors() {
+        let err = parse_permission_scope_spec("project", None).unwrap_err();
+        assert!(err.contains("project scope requires a name"));
+    }
+
+    #[test]
+    fn parse_subject_tool() {
+        use claurst_core::permissions::PermissionSubject;
+        assert_eq!(
+            parse_permission_subject_spec("tool:Bash").unwrap(),
+            PermissionSubject::Tool { name: "Bash".into() }
+        );
+    }
+
+    #[test]
+    fn parse_subject_tool_input_with_contains() {
+        use claurst_core::permissions::{InputMatcher, PermissionSubject};
+        let s = parse_permission_subject_spec("tool-input:Bash:rm -rf").unwrap();
+        match s {
+            PermissionSubject::ToolInput { name, input_match } => {
+                assert_eq!(name, "Bash");
+                assert!(matches!(
+                    input_match,
+                    InputMatcher::Contains(c) if c == "rm -rf"
+                ));
+            }
+            other => panic!("expected ToolInput, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_subject_path_with_mode_and_default() {
+        use claurst_core::permissions::{PathMode, PermissionSubject};
+        // Explicit mode.
+        let s = parse_permission_subject_spec("path:/etc/hosts:read").unwrap();
+        match s {
+            PermissionSubject::Path { path, mode } => {
+                assert_eq!(path, std::path::PathBuf::from("/etc/hosts"));
+                assert_eq!(mode, PathMode::Read);
+            }
+            other => panic!("expected Path, got {:?}", other),
+        }
+        // No mode → Any.
+        let s = parse_permission_subject_spec("path:/tmp/foo").unwrap();
+        match s {
+            PermissionSubject::Path { mode, .. } => assert_eq!(mode, PathMode::Any),
+            other => panic!("expected Path, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_subject_url_glob() {
+        use claurst_core::permissions::{PermissionSubject, UrlPattern};
+        let s = parse_permission_subject_spec("url:https://api.example.com/*").unwrap();
+        match s {
+            PermissionSubject::Url { pattern: UrlPattern(p) } => {
+                assert_eq!(p, "https://api.example.com/*");
+            }
+            other => panic!("expected Url, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_subject_command_bash_glob() {
+        use claurst_core::permissions::{CommandPattern, PermissionSubject, Shell};
+        let s = parse_permission_subject_spec("cmd:bash:*git*").unwrap();
+        match s {
+            PermissionSubject::Command { shell, pattern: CommandPattern(p) } => {
+                assert_eq!(shell, Shell::Bash);
+                assert_eq!(p, "*git*");
+            }
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_subject_unknown_prefix_errors() {
+        let err = parse_permission_subject_spec("nonsense").unwrap_err();
+        assert!(err.contains("Unknown subject"));
+    }
+
+    // ---- /agent run + sugar spawn ------------------------------------------
+
+    use claurst_core::cost::CostTracker as _CostTracker;
+    use claurst_core::live_session::LiveSession;
+    use claurst_core::permissions::PermissionManager;
+    use claurst_core::project_registry::ProjectRegistry;
+    use claurst_core::{AgentConfig, PermissionMode, Settings};
+
+    fn make_ctx_with_live(
+        live: std::sync::Arc<LiveSession>,
+    ) -> CommandContext {
+        let mut ctx = make_ctx();
+        ctx.live_session = Some(live);
+        ctx
+    }
+
+    fn live_with_agent(name: &str) -> std::sync::Arc<LiveSession> {
+        let mut settings = Settings::default();
+        settings
+            .agents
+            .insert(name.to_string(), AgentConfig::default());
+        let cost = _CostTracker::new();
+        let perm = PermissionManager::new(PermissionMode::Default, &settings);
+        LiveSession::with_projects(
+            settings,
+            std::env::temp_dir(),
+            cost,
+            perm,
+            ProjectRegistry::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn agent_run_returns_spawn_variant_for_known_agent() {
+        let live = live_with_agent("alpha");
+        let mut ctx = make_ctx_with_live(live);
+        let cmd = AgentCommand;
+        let result = cmd.execute("run alpha hello world", &mut ctx).await;
+        match result {
+            CommandResult::SpawnNamedAgent { agent_name, prompt } => {
+                assert_eq!(agent_name, "alpha");
+                assert_eq!(prompt, "hello world");
+            }
+            other => panic!("expected SpawnNamedAgent, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_run_missing_prompt_errors() {
+        let live = live_with_agent("alpha");
+        let mut ctx = make_ctx_with_live(live);
+        let cmd = AgentCommand;
+        let result = cmd.execute("run alpha", &mut ctx).await;
+        assert!(matches!(result, CommandResult::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn agent_run_unknown_agent_errors() {
+        let live = live_with_agent("alpha");
+        let mut ctx = make_ctx_with_live(live);
+        let cmd = AgentCommand;
+        let result = cmd.execute("run ghost some prompt", &mut ctx).await;
+        match result {
+            CommandResult::Error(e) => assert!(e.contains("Unknown agent")),
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_sugar_spawn_for_known_agent_with_prompt() {
+        let live = live_with_agent("alpha");
+        let mut ctx = make_ctx_with_live(live);
+        let cmd = AgentCommand;
+        let result = cmd.execute("alpha do this", &mut ctx).await;
+        match result {
+            CommandResult::SpawnNamedAgent { agent_name, prompt } => {
+                assert_eq!(agent_name, "alpha");
+                assert_eq!(prompt, "do this");
+            }
+            other => panic!("expected SpawnNamedAgent, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_sugar_unknown_falls_through_to_error() {
+        let live = live_with_agent("alpha");
+        let mut ctx = make_ctx_with_live(live);
+        let cmd = AgentCommand;
+        // 'ghost' is not known — should NOT spawn, falls through to show
+        // which then errors because ghost doesn't exist.
+        let result = cmd.execute("ghost some prompt", &mut ctx).await;
+        assert!(matches!(result, CommandResult::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn agent_bare_name_shows_details() {
+        let live = live_with_agent("alpha");
+        let mut ctx = make_ctx_with_live(live);
+        let cmd = AgentCommand;
+        let result = cmd.execute("alpha", &mut ctx).await;
+        // No second token + known agent → details, not spawn.
+        match result {
+            CommandResult::Message(s) => assert!(s.contains("Agent: @alpha")),
+            other => panic!("expected Message, got {:?}", other),
+        }
     }
 }

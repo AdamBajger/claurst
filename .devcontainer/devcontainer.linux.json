@@ -18,18 +18,15 @@
   "remoteUser": "vscode",
 
   "mounts": [
-    "source=${localEnv:HOME}/.gnupg,target=/home/vscode/.gnupg,type=bind,consistency=cached",
-    "source=/run/user/1000/gnupg/S.gpg-agent,target=/tmp/S.gpg-agent,type=bind"
+    "source=${localEnv:GPG_AGENT_SOCKET},target=${localEnv:GPG_AGENT_SOCKET},type=bind"
   ],
 
   "remoteEnv": {
-    "GNUPGHOME": "/home/vscode/.gnupg"
+    "GPG_AGENT_SOCKET": "${localEnv:GPG_AGENT_SOCKET}",
+    "GNUPGHOME": "/home/vscode/.gnupg",
+    "GPG_TTY": "/dev/tty",
+    "GIT_TERMINAL_PROMPT": "1"
   },
-
-  "postCreateCommand": "mkdir -p ~/.gnupg && chmod 700 ~/.gnupg && echo 'use-agent' >> ~/.gnupg/gpg.conf",
-
-  "postStartCommand": "ln -sf /tmp/S.gpg-agent $(gpgconf --list-dirs agent-socket) && export GPG_TTY=$(tty)",
-
   "customizations": {
     "vscode": {
       "settings": {

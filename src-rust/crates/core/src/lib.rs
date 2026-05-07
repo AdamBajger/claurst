@@ -782,6 +782,11 @@ pub mod config {
         /// Whether the Kairos system-prompt addendum applies on spawn.
         #[serde(default)]
         pub kairos_addendum: bool,
+        /// Per-agent override of `KAIROS_PERMISSION_POLICY` env. `None` = inherit
+        /// env (which falls back to `DeferToUser`). Applies to permission requests
+        /// originating from non-foreground sources (Cron/Proactive/Agent/BgLoop).
+        #[serde(default)]
+        pub kairos_policy: Option<crate::permissions::KairosPermissionPolicy>,
         /// Per-agent restriction over the runtime tool registry.
         #[serde(default)]
         pub tools: ToolConfig,
@@ -815,6 +820,7 @@ pub mod config {
                 tool_result_budget: None,
                 project: None,
                 kairos_addendum: false,
+                kairos_policy: None,
                 tools: ToolConfig::default(),
                 mcp: MCPConfig::default(),
             }
@@ -1957,7 +1963,11 @@ pub mod context {
 // ---------------------------------------------------------------------------
 pub mod permissions {
     use serde::{Deserialize, Serialize};
-    use std::sync::{Arc, Mutex};
+    // Round 2 §"Concurrency / Robustness Decisions": all locks use parking_lot
+    // (no poisoning). PermissionManager is shared across the spawn / TUI /
+    // bridge paths, so the handlers below take parking_lot::Mutex<...>.
+    use std::sync::Arc;
+    use parking_lot::Mutex;
 
     // -----------------------------------------------------------------------
     // Danger level assigned to each tool type
@@ -2333,6 +2343,14 @@ pub mod permissions {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub path_pattern: Option<String>,
         pub action: PermissionAction,
+        /// Round 2 disk extension — additive, serde-defaulted so legacy
+        /// `settings.json` entries (lacking these fields) still load. Project
+        /// rules round-trip with full fidelity (id, subject); settings rules
+        /// can opt in over time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<uuid::Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subject: Option<PermissionSubject>,
     }
 
     impl From<&PermissionRule> for SerializedPermissionRule {
@@ -2341,6 +2359,8 @@ pub mod permissions {
                 tool_name: r.tool_name.clone(),
                 path_pattern: r.path_pattern.clone(),
                 action: r.action.clone(),
+                id: Some(r.id),
+                subject: r.subject.clone(),
             }
         }
     }
@@ -2348,12 +2368,12 @@ pub mod permissions {
     impl From<&SerializedPermissionRule> for PermissionRule {
         fn from(s: &SerializedPermissionRule) -> Self {
             Self {
-                id: uuid::Uuid::new_v4(),
+                id: s.id.unwrap_or_else(uuid::Uuid::new_v4),
                 tool_name: s.tool_name.clone(),
                 path_pattern: s.path_pattern.clone(),
                 action: s.action.clone(),
                 scope: PermissionScope::Forever,
-                subject: None,
+                subject: s.subject.clone(),
                 created_at: chrono::Utc::now(),
             }
         }
@@ -2439,6 +2459,9 @@ pub mod permissions {
         pub tool_use_id: String,
         pub created_at: std::time::Instant,
         pub resolve_tx: tokio::sync::oneshot::Sender<PermissionDecision>,
+        /// Phase 9 attribution: who initiated the work that needs this permission.
+        /// `None` = pre-source-aware caller (legacy `register_pending`).
+        pub source: Option<TaskSource>,
     }
 
     /// Central permission manager: holds mode, session rules, persistent
@@ -2449,8 +2472,20 @@ pub mod permissions {
         pub session_rules: Vec<PermissionRule>,
         /// Rules loaded from / saved to settings.json.
         pub persistent_rules: Vec<PermissionRule>,
+        /// Phase 8.5/9: rules carrying `PermissionScope::Project { name }`,
+        /// bucketed by project name. Only the active project's bucket
+        /// participates in `evaluate`. Disk persistence (mirroring into
+        /// `ProjectConfig.permission_rules`) is the caller's responsibility.
+        project_rules: std::collections::BTreeMap<String, Vec<PermissionRule>>,
+        /// Active project name. Set by `LiveSession::switch_project`.
+        active_project: Option<String>,
         /// Pending interactive decisions keyed by tool_use_id.
         pending: Vec<PendingPermission>,
+        /// Phase 10: optional event log handle. When set, `register_pending_*`
+        /// emits `PermissionRequested` and `resolve_pending` emits
+        /// `PermissionDecided`. `None` keeps the manager silent (tests / pre-
+        /// bootstrap paths).
+        event_log: Option<crate::event_log::EventLog>,
     }
 
     impl PermissionManager {
@@ -2469,8 +2504,48 @@ pub mod permissions {
                 mode,
                 session_rules: Vec::new(),
                 persistent_rules,
+                project_rules: std::collections::BTreeMap::new(),
+                active_project: None,
                 pending: Vec::new(),
+                event_log: None,
             }
+        }
+
+        /// Phase 8.5/9: set the active project. The named bucket's rules then
+        /// participate in `evaluate`. Pass `None` to clear.
+        pub fn set_active_project(&mut self, name: Option<String>) {
+            self.active_project = name;
+        }
+
+        pub fn active_project(&self) -> Option<&str> {
+            self.active_project.as_deref()
+        }
+
+        /// Replace the rule list for a named project. Used at `/project switch`
+        /// to load rules from the project's on-disk `ProjectConfig`.
+        pub fn set_project_rules(&mut self, name: &str, rules: Vec<PermissionRule>) {
+            self.project_rules.insert(name.to_string(), rules);
+        }
+
+        /// Snapshot of rules for a named project (cloned for caller).
+        pub fn project_rules_for(&self, name: &str) -> Vec<PermissionRule> {
+            self.project_rules
+                .get(name)
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        /// Drop the rule list for a named project. Returns `true` if a bucket
+        /// was removed.
+        pub fn drop_project_rules(&mut self, name: &str) -> bool {
+            self.project_rules.remove(name).is_some()
+        }
+
+        /// Phase 10: attach an event-log handle so the manager emits
+        /// `PermissionRequested` / `PermissionDecided`. Called once at
+        /// LiveSession bootstrap. Cheap to call again — replaces the handle.
+        pub fn set_event_log(&mut self, log: crate::event_log::EventLog) {
+            self.event_log = Some(log);
         }
 
         // ----------------------------------------------------------------
@@ -2503,10 +2578,18 @@ pub mod permissions {
 
             // Steps 2–3 — evaluate explicit rules (deny has priority over
             // allow; persistent rules evaluated before session rules within
-            // each polarity, matching TS rule-source ordering)
+            // each polarity, matching TS rule-source ordering). Active
+            // project's bucket slots between persistent and session.
+            let active_project_rules = self
+                .active_project
+                .as_ref()
+                .and_then(|n| self.project_rules.get(n))
+                .into_iter()
+                .flat_map(|v| v.iter());
             let all_rules = self
                 .persistent_rules
                 .iter()
+                .chain(active_project_rules)
                 .chain(self.session_rules.iter());
 
             let mut deny_matched = false;
@@ -2561,17 +2644,72 @@ pub mod permissions {
             }
         }
 
+        /// Phase 9: evaluate with source attribution + Kairos policy override.
+        ///
+        /// Computes the base decision via `evaluate()` then applies the Kairos
+        /// policy to non-foreground sources before any `Ask` reaches the user:
+        ///
+        /// - `Reject` + would-Ask → `Deny` (never prompts the user).
+        /// - `AutoAllowRead` + would-Ask + `is_read_only` → `Allow`.
+        /// - `DeferToUser` (default) → unchanged, lets `Ask` flow to the dialog.
+        ///
+        /// Foreground sources (`MainSession`, `SlashCommand`) and missing
+        /// source are unaffected — they always reach the dialog when needed.
+        pub fn evaluate_with_source(
+            &self,
+            req: &PermissionRequest,
+            source: Option<&TaskSource>,
+            policy: KairosPermissionPolicy,
+        ) -> PermissionDecision {
+            let base = self.evaluate(
+                &req.tool_name,
+                &req.description,
+                req.details.as_deref(),
+            );
+            let is_background = matches!(
+                source,
+                Some(TaskSource::Cron(_))
+                    | Some(TaskSource::Proactive)
+                    | Some(TaskSource::Agent(_))
+                    | Some(TaskSource::BgLoop(_))
+                    | Some(TaskSource::System)
+            );
+            if !is_background {
+                return base;
+            }
+            match (base, policy) {
+                (PermissionDecision::Ask { .. }, KairosPermissionPolicy::Reject) => {
+                    PermissionDecision::Deny
+                }
+                (PermissionDecision::Ask { .. }, KairosPermissionPolicy::AutoAllowRead)
+                    if req.is_read_only =>
+                {
+                    PermissionDecision::Allow
+                }
+                (other, _) => other,
+            }
+        }
+
         // ----------------------------------------------------------------
         // Rule management
         // ----------------------------------------------------------------
 
         /// Add an arbitrary rule to this manager.
+        ///
+        /// `Project { name }`-scoped rules go into `project_rules[name]` and
+        /// participate in evaluation only while that project is active. Disk
+        /// mirroring (into `ProjectConfig.permission_rules`) is the caller's
+        /// responsibility — the manager has no direct registry access.
         pub fn add_rule(&mut self, rule: PermissionRule) {
-            match rule.scope {
+            match rule.scope.clone() {
                 PermissionScope::Once => { /* never tracked — request-scope only */ }
                 PermissionScope::Session => self.session_rules.push(rule),
-                // TODO Phase 8.5: route to per-project storage slot once wired.
-                PermissionScope::Project { .. } => self.persistent_rules.push(rule),
+                PermissionScope::Project { name } => {
+                    self.project_rules
+                        .entry(name)
+                        .or_default()
+                        .push(rule);
+                }
                 PermissionScope::Forever => self.persistent_rules.push(rule),
             }
         }
@@ -2642,6 +2780,68 @@ pub mod permissions {
             Ok(())
         }
 
+        /// Phase 9: revoke a rule by stable `id`. Searches session rules first
+        /// (in-memory only, no settings write), then project buckets (in-memory
+        /// only — caller mirrors to `ProjectConfig.permission_rules` on disk),
+        /// then persistent rules (writes updated `Settings.permission_rules`
+        /// back to disk).
+        ///
+        /// Returns the removed rule, or `None` if no rule with that id exists.
+        pub fn remove_rule_by_id(
+            &mut self,
+            id: uuid::Uuid,
+            settings: &mut crate::config::Settings,
+        ) -> crate::error::Result<Option<PermissionRule>> {
+            if let Some(pos) = self.session_rules.iter().position(|r| r.id == id) {
+                return Ok(Some(self.session_rules.remove(pos)));
+            }
+            // Search project buckets — first match wins.
+            let project_hit: Option<(String, usize)> = self
+                .project_rules
+                .iter()
+                .find_map(|(k, v)| {
+                    v.iter().position(|r| r.id == id).map(|i| (k.clone(), i))
+                });
+            if let Some((name, pos)) = project_hit {
+                let removed = self
+                    .project_rules
+                    .get_mut(&name)
+                    .expect("bucket existed")
+                    .remove(pos);
+                return Ok(Some(removed));
+            }
+            if let Some(pos) = self.persistent_rules.iter().position(|r| r.id == id) {
+                let removed = self.persistent_rules.remove(pos);
+                // Mirror removal to settings — match by id when present, else fall
+                // back to (tool, path, action) tuple for legacy entries lacking id.
+                let serialized_pos = settings.permission_rules.iter().position(|s| {
+                    s.tool_name == removed.tool_name
+                        && s.path_pattern == removed.path_pattern
+                        && s.action == removed.action
+                });
+                if let Some(sp) = serialized_pos {
+                    settings.permission_rules.remove(sp);
+                    settings
+                        .save_sync()
+                        .map_err(|e| crate::error::ClaudeError::Config(e.to_string()))?;
+                }
+                return Ok(Some(removed));
+            }
+            Ok(None)
+        }
+
+        /// Phase 9: snapshot of all in-memory rules (session + persistent +
+        /// every project bucket) for `/permissions list`. Returns clones so
+        /// callers don't hold the lock.
+        pub fn list_rules(&self) -> Vec<PermissionRule> {
+            self.session_rules
+                .iter()
+                .chain(self.persistent_rules.iter())
+                .chain(self.project_rules.values().flat_map(|v| v.iter()))
+                .cloned()
+                .collect()
+        }
+
         // ----------------------------------------------------------------
         // Bridge / async pending permissions
         // ----------------------------------------------------------------
@@ -2653,13 +2853,40 @@ pub mod permissions {
             &mut self,
             id: String,
         ) -> tokio::sync::oneshot::Receiver<PermissionDecision> {
+            self.register_pending_with_source(id, None)
+        }
+
+        /// Phase 9: register with optional source attribution. The TUI dialog
+        /// can read `pending.source` to label the prompt (e.g. "Cron task X").
+        pub fn register_pending_with_source(
+            &mut self,
+            id: String,
+            source: Option<TaskSource>,
+        ) -> tokio::sync::oneshot::Receiver<PermissionDecision> {
             let (tx, rx) = tokio::sync::oneshot::channel();
+            if let Some(log) = self.event_log.as_ref() {
+                log.push(crate::event_log::Event::now(
+                    crate::event_log::EventKind::PermissionRequested,
+                    source.clone().unwrap_or(TaskSource::MainSession),
+                    format!("permission requested for {}", id),
+                ));
+            }
             self.pending.push(PendingPermission {
                 tool_use_id: id,
                 created_at: std::time::Instant::now(),
                 resolve_tx: tx,
+                source,
             });
             rx
+        }
+
+        /// Snapshot of pending requests for `/permissions` listings or
+        /// `--by-source` filters. Returns `(tool_use_id, source)` tuples.
+        pub fn pending_snapshot(&self) -> Vec<(String, Option<TaskSource>)> {
+            self.pending
+                .iter()
+                .map(|p| (p.tool_use_id.clone(), p.source.clone()))
+                .collect()
         }
 
         /// Resolve a pending permission by `tool_use_id`, delivering
@@ -2667,6 +2894,13 @@ pub mod permissions {
         pub fn resolve_pending(&mut self, id: &str, decision: PermissionDecision) {
             if let Some(pos) = self.pending.iter().position(|p| p.tool_use_id == id) {
                 let pending = self.pending.remove(pos);
+                if let Some(log) = self.event_log.as_ref() {
+                    log.push(crate::event_log::Event::now(
+                        crate::event_log::EventKind::PermissionDecided(decision.clone()),
+                        pending.source.clone().unwrap_or(TaskSource::MainSession),
+                        format!("permission decided for {}", id),
+                    ));
+                }
                 let _ = pending.resolve_tx.send(decision);
             }
         }
@@ -2781,18 +3015,17 @@ pub mod permissions {
 
     impl PermissionHandler for ManagedAutoPermissionHandler {
         fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
-            if let Ok(m) = self.manager.lock() {
-                let decision = m.evaluate(
-                    &request.tool_name,
-                    &request.description,
-                    request.details.as_deref(),
-                );
-                return match decision {
-                    PermissionDecision::Ask { .. } => PermissionDecision::Deny,
-                    other => other,
-                };
+            // parking_lot Mutex never poisons — `lock()` returns the guard.
+            let m = self.manager.lock();
+            let decision = m.evaluate(
+                &request.tool_name,
+                &request.description,
+                request.details.as_deref(),
+            );
+            match decision {
+                PermissionDecision::Ask { .. } => PermissionDecision::Deny,
+                other => other,
             }
-            PermissionDecision::Deny
         }
 
         fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
@@ -2816,15 +3049,12 @@ pub mod permissions {
 
     impl PermissionHandler for ManagedInteractivePermissionHandler {
         fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
-            if let Ok(m) = self.manager.lock() {
-                return m.evaluate(
-                    &request.tool_name,
-                    &request.description,
-                    request.details.as_deref(),
-                );
-            }
-            // If the lock is poisoned fall back to allow (user is watching)
-            PermissionDecision::Allow
+            let m = self.manager.lock();
+            m.evaluate(
+                &request.tool_name,
+                &request.description,
+                request.details.as_deref(),
+            )
         }
 
         fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {

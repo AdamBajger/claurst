@@ -212,8 +212,81 @@ pub async fn execute_agent_run(req: AgentRunRequest, ctx: AgentRunContext) -> bo
     is_error
 }
 
+/// Run `execute_agent_run` with `catch_unwind` so a panic inside the agent
+/// run is captured and emitted as a `TaskPanicked` event. Caller decides
+/// whether to spawn — useful when the spawn site has its own pre-work
+/// (e.g. `wait_for_mcp_settlement` in `/btw` or `/agent run`).
+///
+/// Returns `Ok(is_error)` from the underlying `execute_agent_run` when no
+/// panic occurred; returns `Err(panic_message)` when a panic was caught.
+pub async fn execute_agent_run_safe(
+    req: AgentRunRequest,
+    ctx: AgentRunContext,
+) -> Result<bool, String> {
+    use futures::FutureExt;
+
+    let run_id = req.run_id.clone();
+    let task_source = req.source.as_task_source();
+    let tracker = ctx.task_tracker.clone();
+    let log = ctx.event_log.clone();
+    let result_tx = ctx.result_tx.clone();
+    let source_label_for_panic = source_label(&req.source);
+
+    let panic_payload = std::panic::AssertUnwindSafe(execute_agent_run(req, ctx))
+        .catch_unwind()
+        .await;
+
+    match panic_payload {
+        Ok(is_error) => Ok(is_error),
+        Err(payload) => {
+            let msg = panic_message(&payload);
+            tracing::error!(run_id = %run_id, msg = %msg, "agent run panicked");
+            if let Some(log) = log {
+                log.push(Event::now(
+                    EventKind::TaskPanicked { msg: msg.clone() },
+                    task_source.clone(),
+                    format!("agent run {} panicked", run_id),
+                ));
+            }
+            // Best-effort cleanup: deregister so /tasks doesn't show a ghost.
+            if let Some(tracker) = tracker {
+                tracker.deregister(&run_id);
+            }
+            // Surface the panic to the TUI drain loop as a failed
+            // `AgentRunResult` so the user sees it instead of a silent worker
+            // death.
+            if let Some(tx) = result_tx {
+                let _ = tx.send(AgentRunResult {
+                    run_id: run_id.clone(),
+                    source: AgentRunSource::SlashCommand {
+                        name: source_label_for_panic,
+                    },
+                    output: format!("Background run panicked: {}", msg),
+                    is_error: true,
+                });
+            }
+            Err(msg)
+        }
+    }
+}
+
 /// Spawns a direct-prompt agent task in the background (cron, proactive).
 /// The query config must already have Kairos bootstrap applied before calling this.
+///
+/// Wraps `execute_agent_run` with `execute_agent_run_safe` so a panic inside
+/// the spawn doesn't kill the tokio worker. Process survives; task marked
+/// failed in tracker; failed `AgentRunResult` emitted.
 pub fn spawn_agent_run(req: AgentRunRequest, ctx: AgentRunContext) {
-    tokio::spawn(execute_agent_run(req, ctx));
+    tokio::spawn(execute_agent_run_safe(req, ctx));
+}
+
+/// Extract a human-readable message from a panic payload (`Box<dyn Any>`).
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "<non-string panic>".to_string()
 }

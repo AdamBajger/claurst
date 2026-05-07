@@ -387,7 +387,10 @@ mod tests {
     fn onboarding_defaults_hidden() {
         let state = OnboardingDialogState::new();
         assert!(!state.visible);
-        assert_eq!(state.page, OnboardingPage::Welcome);
+        // Default page is `ProviderSetup` (set in commit 929d693 when
+        // multi-provider support landed). Callers pick `show()` for the normal
+        // onboarding flow or `show_provider_setup()` for first-run-no-creds.
+        assert_eq!(state.page, OnboardingPage::ProviderSetup);
     }
 
     #[test]

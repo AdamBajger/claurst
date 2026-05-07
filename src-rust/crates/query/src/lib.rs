@@ -2052,18 +2052,94 @@ async fn execute_tool(
     tools: &[Box<dyn Tool>],
     ctx: &ToolContext,
 ) -> ToolResult {
+    use claurst_core::event_log::{Event, EventKind, ToolStatus};
+    use claurst_core::permissions::TaskSource;
+    use claurst_core::task_tracker::{SimpleTrackedTask, TaskKind, TaskStatus};
+    use tokio_util::sync::CancellationToken;
+
     let tool = tools.iter().find(|t| t.name() == name);
 
-    match tool {
-        Some(tool) => {
-            debug!(tool = name, "Executing tool");
-            tool.execute(input.clone(), ctx).await
-        }
+    let tool = match tool {
+        Some(t) => t,
         None => {
             warn!(tool = name, "Unknown tool requested");
-            ToolResult::error(format!("Unknown tool: {}", name))
+            // Emit a Failed ToolCall event so /activity reflects the unknown
+            // tool attempt; tracker untouched (no entry to register).
+            if let Some(log) = ctx.event_log.as_ref() {
+                log.push(Event::now(
+                    EventKind::ToolCall {
+                        tool: name.to_string(),
+                        status: ToolStatus::Failed,
+                    },
+                    TaskSource::MainSession,
+                    format!("unknown tool: {}", name),
+                ));
+            }
+            return ToolResult::error(format!("Unknown tool: {}", name));
         }
+    };
+
+    debug!(tool = name, "Executing tool");
+
+    if let Some(log) = ctx.event_log.as_ref() {
+        log.push(Event::now(
+            EventKind::ToolCall {
+                tool: name.to_string(),
+                status: ToolStatus::Started,
+            },
+            TaskSource::MainSession,
+            format!("dispatch {}", name),
+        ));
     }
+
+    // Phase 9.5: register a `ToolCallTask` so `/tasks` reflects in-flight
+    // tool calls (and `/stop all` can cancel them via the token). Tool
+    // implementations can poll the token through `ctx` if they wish; the
+    // registration is best-effort and skipped when no tracker is plumbed.
+    let tracked = ctx.task_tracker.as_ref().map(|tracker| {
+        let id = format!("tool:{}:{}", name, uuid::Uuid::new_v4());
+        let task = SimpleTrackedTask::new(
+            id.clone(),
+            TaskKind::Tool,
+            TaskSource::MainSession,
+            format!("tool {}", name),
+            CancellationToken::new(),
+        );
+        tracker.register(task.clone());
+        (tracker.clone(), task, id)
+    });
+
+    let result = tool.execute(input.clone(), ctx).await;
+
+    if let Some((tracker, task, id)) = tracked.as_ref() {
+        let final_status = if result.is_error {
+            TaskStatus::Failed {
+                error: result.content.chars().take(120).collect(),
+            }
+        } else {
+            TaskStatus::Completed
+        };
+        task.set_status(final_status);
+        tracker.deregister(id);
+    }
+
+    if let Some(log) = ctx.event_log.as_ref() {
+        let status = if result.is_error {
+            ToolStatus::Failed
+        } else {
+            ToolStatus::Succeeded
+        };
+        log.push(Event::now(
+            EventKind::ToolCall {
+                tool: name.to_string(),
+                status,
+            },
+            TaskSource::MainSession,
+            format!("finish {}", name),
+        ));
+    }
+
+    result
 }
 
 /// Load persisted todos for `session_id` and return a nudge string if any are

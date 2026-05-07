@@ -89,6 +89,7 @@ fn is_modal_open(app: &App) -> bool {
     app.permission_request.is_some()
         || app.rewind_flow.visible
         || app.tasks_overlay.visible
+        || app.activity_overlay.visible
         || app.help_overlay.visible
         || app.show_help
         || app.history_search_overlay.visible
@@ -456,6 +457,14 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     }
 
     // Tasks overlay (Ctrl+T)
+    if app.activity_overlay.visible {
+        crate::activity_overlay::render_activity_overlay(
+            frame,
+            &app.activity_overlay,
+            &app.activity_events,
+            size,
+        );
+    }
     if app.tasks_overlay.visible {
         render_tasks_overlay(frame, &app.tasks_overlay, size);
     }
@@ -1423,8 +1432,12 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         "Recent activity",
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )));
+    let activity_text = app
+        .recent_activity
+        .as_deref()
+        .unwrap_or("No recent activity");
     right_lines.push(Line::from(Span::styled(
-        "No recent activity",
+        activity_text.to_string(),
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -2200,7 +2213,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         parts
     };
 
-    // Gap fill
+    // Gap fill — and (Phase 10) recent-activity surface in the middle when room.
     let left_len: usize = left_spans
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
@@ -2209,10 +2222,41 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
-    let gap = (area.width as usize).saturating_sub(left_len + right_len);
+    let total_room = (area.width as usize).saturating_sub(left_len + right_len);
+
+    // If room ≥ 30 and recent_activity is set, render a centred activity badge
+    // with its summary truncated to the available width minus a small margin.
+    // Otherwise, fall back to plain gap fill.
+    let mut middle_spans: Vec<Span<'_>> = Vec::new();
+    let middle_len: usize = if total_room >= 30 {
+        if let Some(activity) = app.recent_activity.as_deref() {
+            // Reserve 4-char margin on either side of the badge.
+            let cap = total_room.saturating_sub(8);
+            let truncated: String = activity.chars().take(cap).collect();
+            let badge = format!("\u{2022} {}", truncated);
+            let w = UnicodeWidthStr::width(badge.as_str());
+            middle_spans.push(Span::styled(
+                badge,
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ));
+            w
+        } else {
+            0
+        }
+    } else {
+        0
+    };
 
     let mut spans = left_spans;
-    spans.push(Span::raw(" ".repeat(gap)));
+    if middle_len > 0 {
+        let pad_left = (total_room.saturating_sub(middle_len)) / 2;
+        let pad_right = total_room.saturating_sub(middle_len + pad_left);
+        spans.push(Span::raw(" ".repeat(pad_left)));
+        spans.extend(middle_spans);
+        spans.push(Span::raw(" ".repeat(pad_right)));
+    } else {
+        spans.push(Span::raw(" ".repeat(total_room)));
+    }
     spans.extend(right_spans);
 
     frame.render_widget(Paragraph::new(vec![Line::from(spans)]), area);

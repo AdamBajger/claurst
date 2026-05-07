@@ -31,6 +31,8 @@ fn empty_ctx_with_live(live: Option<Arc<LiveSession>>) -> CommandContext {
         remote_session_url: None,
         mcp_manager: None,
         live_session: live,
+        task_tracker: None,
+        event_log: None,
     }
 }
 

@@ -1120,6 +1120,8 @@ mod tests {
             remote_session_url: None,
             mcp_manager: None,
             live_session: None,
+            task_tracker: None,
+            event_log: None,
         }
     }
 

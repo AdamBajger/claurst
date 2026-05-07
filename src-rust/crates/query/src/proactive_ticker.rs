@@ -20,6 +20,8 @@ use claurst_tools::{Tool, ToolContext};
 use crate::background_runner::{AgentRunContext, AgentRunRequest, AgentRunResult, AgentRunSource, execute_agent_run};
 use crate::QueryConfig;
 use claurst_core::AgentConfig;
+use claurst_core::event_log::EventLog;
+use claurst_core::task_tracker::TaskTracker;
 
 const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 /// Number of consecutive per-tick cost overruns that shut the ticker down.
@@ -33,6 +35,8 @@ pub fn start_proactive_ticker(
     tools: Arc<Vec<Box<dyn Tool>>>,
     result_tx: UnboundedSender<AgentRunResult>,
     cancel: CancellationToken,
+    task_tracker: Option<TaskTracker>,
+    event_log: Option<EventLog>,
 ) {
     let base_interval = Duration::from_secs(claurst_core::kairos_gate::proactive_interval_secs());
     let tick_cost_ceiling = claurst_core::kairos_gate::proactive_tick_max_usd();
@@ -86,8 +90,8 @@ pub fn start_proactive_ticker(
                     client: client.clone(),
                     tools: tools.clone(),
                     result_tx: Some(result_tx.clone()),
-                    task_tracker: None,
-                    event_log: None,
+                    task_tracker: task_tracker.clone(),
+                    event_log: event_log.clone(),
                 },
             )
             .await;

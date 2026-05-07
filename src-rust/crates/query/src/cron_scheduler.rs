@@ -13,7 +13,10 @@ use crate::background_runner::{
 };
 use crate::QueryConfig;
 use claurst_core::AgentConfig;
+use claurst_core::event_log::{Event, EventKind, EventLog};
 use claurst_core::live_session::SharedLiveSession;
+use claurst_core::permissions::TaskSource;
+use claurst_core::task_tracker::TaskTracker;
 use claurst_tools::{Tool, ToolContext};
 use chrono::Timelike;
 use std::sync::Arc;
@@ -39,6 +42,8 @@ pub fn start_cron_scheduler(
     result_tx: Option<mpsc::UnboundedSender<AgentRunResult>>,
     cancel: CancellationToken,
     live_session: Option<SharedLiveSession>,
+    task_tracker: Option<TaskTracker>,
+    event_log: Option<EventLog>,
 ) {
     tokio::spawn(async move {
         info!("Cron scheduler started");
@@ -75,6 +80,29 @@ pub fn start_cron_scheduler(
                     (Some(live), Some(name)) => live.resolve_agent_config(Some(name)),
                     _ => AgentConfig::default(),
                 };
+
+                // Phase 10: emit CronFired event before spawn so /activity has
+                // the trigger recorded even if the run fails before BackgroundStart.
+                if let Some(log) = event_log.as_ref() {
+                    log.push(Event::now(
+                        EventKind::CronFired { task_id: task.id.clone() },
+                        TaskSource::Cron(task.id.clone()),
+                        format!("cron {} fired ({})", task.id, task.cron),
+                    ));
+                    // Emit AgentSpawned when this cron task pins a named agent.
+                    // Anonymous spawns omit it (the BackgroundStart event already
+                    // covers the lifecycle).
+                    if let Some(name) = task.agent_name.as_deref() {
+                        log.push(Event::now(
+                            EventKind::AgentSpawned {
+                                agent_name: Some(name.to_string()),
+                            },
+                            TaskSource::Cron(task.id.clone()),
+                            format!("agent '{}' spawned by cron {}", name, task.id),
+                        ));
+                    }
+                }
+
                 spawn_agent_run(
                     AgentRunRequest {
                         run_id,
@@ -88,8 +116,8 @@ pub fn start_cron_scheduler(
                         client: client.clone(),
                         tools: tools.clone(),
                         result_tx: result_tx.clone(),
-                        task_tracker: None,
-                        event_log: None,
+                        task_tracker: task_tracker.clone(),
+                        event_log: event_log.clone(),
                     },
                 );
             }

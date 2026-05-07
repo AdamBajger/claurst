@@ -268,6 +268,8 @@ mod tests {
             config: Config::default(),
             managed_agent_config: None,
             completion_notifier: None,
+            task_tracker: None,
+            event_log: None,
         }
     }
 }

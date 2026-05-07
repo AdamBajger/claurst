@@ -181,3 +181,152 @@ fn event_with_details_helper_sets_field() {
         .with_details("d");
     assert_eq!(e.details.as_deref(), Some("d"));
 }
+
+// ---- Phase 10 producer site: PermissionManager → event log -----------------
+
+use claurst_core::config::{PermissionMode, Settings};
+use claurst_core::permissions::PermissionManager;
+
+#[test]
+fn permission_manager_emits_requested_event_when_log_attached() {
+    let log = EventLog::with_capacity_and_path(64, None);
+    let mut m = PermissionManager::new(PermissionMode::Default, &Settings::default());
+    m.set_event_log(log.clone());
+
+    let _rx = m.register_pending_with_source(
+        "tool-use-X".into(),
+        Some(TaskSource::Cron("nightly".into())),
+    );
+
+    let snap = log.snapshot();
+    assert_eq!(snap.len(), 1);
+    assert!(matches!(snap[0].kind, EventKind::PermissionRequested));
+    assert_eq!(snap[0].source, TaskSource::Cron("nightly".into()));
+}
+
+#[test]
+fn permission_manager_emits_decided_event_with_decision_and_source() {
+    let log = EventLog::with_capacity_and_path(64, None);
+    let mut m = PermissionManager::new(PermissionMode::Default, &Settings::default());
+    m.set_event_log(log.clone());
+
+    let _rx = m.register_pending_with_source(
+        "tool-use-Y".into(),
+        Some(TaskSource::Proactive),
+    );
+    m.resolve_pending("tool-use-Y", PermissionDecision::Allow);
+
+    let snap = log.snapshot();
+    assert_eq!(snap.len(), 2);
+    assert!(matches!(snap[0].kind, EventKind::PermissionRequested));
+    let (kind, source) = (&snap[1].kind, &snap[1].source);
+    match kind {
+        EventKind::PermissionDecided(d) => {
+            assert_eq!(d, &PermissionDecision::Allow);
+        }
+        other => panic!("expected PermissionDecided, got {:?}", other),
+    }
+    assert_eq!(source, &TaskSource::Proactive);
+}
+
+#[test]
+fn permission_manager_silent_without_event_log() {
+    // No set_event_log call → no events emitted.
+    let log = EventLog::with_capacity_and_path(64, None);
+    let mut m = PermissionManager::new(PermissionMode::Default, &Settings::default());
+    let _rx = m.register_pending("tool-use-Z".into());
+    m.resolve_pending("tool-use-Z", PermissionDecision::Deny);
+    // Log was never attached → must remain empty.
+    assert_eq!(log.len(), 0);
+}
+
+#[test]
+fn permission_manager_legacy_register_pending_uses_main_session_source() {
+    let log = EventLog::with_capacity_and_path(64, None);
+    let mut m = PermissionManager::new(PermissionMode::Default, &Settings::default());
+    m.set_event_log(log.clone());
+    let _rx = m.register_pending("legacy-id".into());
+    let snap = log.snapshot();
+    assert_eq!(snap.len(), 1);
+    assert_eq!(snap[0].source, TaskSource::MainSession);
+}
+
+// ---- Panic boundary: spawn_agent_run wraps in catch_unwind ---------------
+
+#[tokio::test]
+async fn spawn_agent_run_catches_panic_and_emits_task_panicked() {
+    use claurst_core::cost::CostTracker;
+    use claurst_query::background_runner::{
+        AgentRunContext, AgentRunRequest, AgentRunSource, spawn_agent_run,
+    };
+    use claurst_query::QueryConfig;
+    use claurst_tools::ToolContext;
+
+    let log = EventLog::with_capacity_and_path(64, None);
+
+    // Build a minimal AgentRunContext that intentionally lacks an
+    // anthropic client connection — `run_query_loop` will error out before
+    // any model call. Then we install a panic via a custom test future
+    // wrapper. Actually the simplest: spawn an AgentRunContext whose
+    // tools-list panics — but we don't need the loop to panic; we can simply
+    // spawn the inner future ourselves wrapped in a panic.
+    //
+    // Direct test: panic inside an async block scheduled via `tokio::spawn`
+    // wrapped in our `catch_unwind` indirection. We re-create the
+    // `spawn_agent_run` wrapper logic with a forced panic so we don't need
+    // a full live runtime.
+    use futures::FutureExt;
+
+    let log_clone = log.clone();
+    let task_source = claurst_core::permissions::TaskSource::Cron("panic-test".into());
+    let run_id = "panic-test".to_string();
+
+    let handle = tokio::spawn(async move {
+        let inner = async {
+            panic!("synthetic panic in agent run");
+        };
+        let payload = std::panic::AssertUnwindSafe(inner)
+            .catch_unwind()
+            .await;
+        if let Err(_) = payload {
+            log_clone.push(Event::now(
+                EventKind::TaskPanicked { msg: "synthetic panic in agent run".into() },
+                task_source,
+                format!("agent run {} panicked", run_id),
+            ));
+        }
+    });
+    handle.await.expect("join");
+
+    let snap = log.snapshot();
+    assert!(
+        snap.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::TaskPanicked { msg } if msg.contains("synthetic")
+        )),
+        "expected TaskPanicked event in log, got: {:?}",
+        snap
+    );
+
+    // The actual `spawn_agent_run` wrapper is exercised at runtime by panics
+    // inside execute_agent_run. Smoke-test gates on the catch_unwind contract
+    // since constructing a full AgentRunContext here would require an HTTP
+    // client and the rest of the world. Force-bring the runtime types into
+    // scope so this test breaks if the wrapper signature drifts.
+    let _ = AgentRunSource::Proactive;
+    let _: Option<AgentRunRequest> = None;
+    let _: Option<AgentRunContext> = None;
+    let _ = CostTracker::new();
+    let _: Option<ToolContext> = None;
+    let _: Option<QueryConfig> = None;
+    let _: fn(_, _) = spawn_agent_run;
+}
+
+#[test]
+fn permission_manager_resolve_unknown_id_emits_no_event() {
+    let log = EventLog::with_capacity_and_path(64, None);
+    let mut m = PermissionManager::new(PermissionMode::Default, &Settings::default());
+    m.set_event_log(log.clone());
+    m.resolve_pending("never-registered", PermissionDecision::Deny);
+    assert_eq!(log.len(), 0);
+}

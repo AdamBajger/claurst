@@ -52,6 +52,7 @@ pub mod team_tool;
 pub mod remote_trigger;
 pub mod formatter;
 pub mod monitor_tool;
+pub mod stop_all_tasks;
 
 // Re-exports for convenience.
 pub use formatter::try_format_file;
@@ -241,6 +242,12 @@ pub struct ToolContext {
     /// Optional notifier for injecting completion messages into the next agent turn.
     /// Set when the query loop has a command queue wired up.
     pub completion_notifier: Option<CompletionNotifier>,
+    /// Phase 9.5: process-wide tracker for `/tasks` visibility. `None` in
+    /// pre-LiveSession paths or test fixtures.
+    pub task_tracker: Option<claurst_core::task_tracker::TaskTracker>,
+    /// Phase 10: shared event log. Tool dispatch emits `ToolCall` events here
+    /// with `Started`/`Succeeded`/`Failed` status. `None` keeps dispatch silent.
+    pub event_log: Option<claurst_core::event_log::EventLog>,
 }
 
 impl ToolContext {
@@ -357,10 +364,19 @@ pub trait Tool: Send + Sync {
 }
 
 /// Return true when Kairos brief tools should be exposed in this process.
+///
+/// Defensive against pre-init contexts (tests, headless tool listings before
+/// the gate has been resolved). Calling `is_kairos_brief_active` directly
+/// panics when `RUNTIME_STATE` is uninitialized; here we read the optional
+/// snapshot and treat absence as "Kairos off". Production paths always
+/// initialize the gate before any tool listing, so the false branch is a
+/// safe default.
 pub fn kairos_brief_tools_enabled() -> bool {
     #[cfg(feature = "kairos_brief")]
     {
-        claurst_core::kairos_gate::is_kairos_brief_active()
+        claurst_core::kairos_gate::runtime_state()
+            .map(|s| s.brief_enabled)
+            .unwrap_or(false)
     }
 
     #[cfg(not(feature = "kairos_brief"))]
@@ -574,6 +590,8 @@ mod tests {
             config: Config::default(),
             managed_agent_config: None,
             completion_notifier: None,
+            task_tracker: None,
+            event_log: None,
         };
 
         // Absolute paths pass through unchanged
@@ -604,6 +622,8 @@ mod tests {
             config: Config::default(),
             managed_agent_config: None,
             completion_notifier: None,
+            task_tracker: None,
+            event_log: None,
         };
 
         // Relative paths get joined with working_dir

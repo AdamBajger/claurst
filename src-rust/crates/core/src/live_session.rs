@@ -20,6 +20,30 @@ use crate::cost::CostTracker;
 use crate::permissions::PermissionManager;
 use crate::project_registry::{ProjectConfig, ProjectRegistry};
 
+/// Documented lock-acquisition order for the live session aggregate. When
+/// multiple write-guards are needed (e.g. atomic snapshot replace, project
+/// switch), acquire them in this order to avoid deadlocks. The order matches
+/// the field declaration order on `LiveSession` + `RuntimeHandles`.
+///
+/// Per Round 2 roadmap §"Atomic Replace Protocol":
+/// > Acquire all sync write locks in fixed order: settings → ephemeral →
+/// > runtime.working_directory → runtime.active_project → runtime.tools →
+/// > runtime.mcp → runtime.permissions.
+///
+/// This constant is documentation-only; Rust can't statically enforce
+/// acquisition order at the `parking_lot` API level. Reviewers and `unsafe`
+/// concurrent code paths must consult this list.
+pub const LIVE_SESSION_LOCK_ORDER: &[&str] = &[
+    "settings",
+    "ephemeral",
+    "runtime.working_directory",
+    "runtime.active_project",
+    "runtime.project_registry",
+    "runtime.tools",       // attached in later phases
+    "runtime.mcp",         // attached in later phases
+    "runtime.permissions",
+];
+
 /// Top-level live session aggregate. Cloned shallowly via `SharedLiveSession`.
 pub struct LiveSession {
     pub settings: Arc<RwLock<Settings>>,
@@ -72,7 +96,13 @@ pub struct RuntimeHandles {
     pub project_registry: Arc<RwLock<ProjectRegistry>>,
     pub cost_tracker: Arc<CostTracker>,
     pub permissions: Arc<Mutex<PermissionManager>>,
-    // tools / mcp / tasks / command_queue / skill_index / provider_registry /
+    /// Phase 8.5 partial: signals that the CLI's MCP runtime needs to
+    /// reconnect (e.g. after `/project switch` so the active project's
+    /// `mcp_servers` participate). The CLI loop polls this each tick and
+    /// resets it after wiring `App.pending_mcp_reconnect`. Full unified
+    /// `runtime.mcp` registry + atomic-replace lands later.
+    pub mcp_reconnect_pending: Arc<std::sync::atomic::AtomicBool>,
+    // tools / tasks / command_queue / skill_index / provider_registry /
     // model_registry / managed_agents — attached in later phases.
 }
 
@@ -108,6 +138,7 @@ impl LiveSession {
                 project_registry: Arc::new(RwLock::new(project_registry)),
                 cost_tracker,
                 permissions: Arc::new(Mutex::new(permissions)),
+                mcp_reconnect_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         })
     }
@@ -135,27 +166,167 @@ impl LiveSession {
         self.runtime.working_directory.read().clone()
     }
 
-    /// Switch the active project: update `active_project` slot and live cwd.
-    /// Phase 8.5 baseline: updates cwd + active_project marker. Permission rule
-    /// + MCP atomic swap arrives in Phase 9 (PermissionScope::Project) and the
-    /// MCP unified registry wiring (task #24+).
+    /// Switch the active project: update `active_project` slot, live cwd, and
+    /// permission-manager's active-project bucket. Loads the new project's
+    /// `permission_rules` from its `ProjectConfig` into the manager's
+    /// in-memory bucket so `evaluate` consults them. Sets the MCP reconnect
+    /// flag so the CLI loop reconnects the MCP runtime against the merged
+    /// global + project specs (full unified `runtime.mcp` registry +
+    /// atomic-replace protocol still pending).
     ///
     /// Returns `Err(name)` if the named project is not registered.
     pub fn switch_project(&self, name: &str) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
         let cfg = self.lookup_project(name).ok_or_else(|| name.to_string())?;
+        let rules: Vec<crate::permissions::PermissionRule> = cfg
+            .permission_rules
+            .iter()
+            .map(|s| {
+                let mut r = crate::permissions::PermissionRule::from(s);
+                // Mark the rule as belonging to this project (loader contract:
+                // ProjectConfig.permission_rules entries always carry Project scope).
+                r.scope = crate::permissions::PermissionScope::Project {
+                    name: cfg.name.clone(),
+                };
+                r
+            })
+            .collect();
         *self.runtime.working_directory.write() = cfg.root_path.clone();
         *self.runtime.active_project.write() = Some(cfg.name.clone());
+        {
+            let mut perm = self.runtime.permissions.lock();
+            perm.set_project_rules(&cfg.name, rules);
+            perm.set_active_project(Some(cfg.name.clone()));
+        }
+        self.runtime
+            .mcp_reconnect_pending
+            .store(true, Ordering::Release);
         tracing::info!(project = %cfg.name, root = %cfg.root_path.display(), "Active project switched");
         Ok(())
     }
 
-    /// Clear active project; cwd stays as-is.
+    /// Clear active project; cwd stays as-is. Permission-manager's active
+    /// bucket cleared so its rules stop affecting evaluation. Also flags MCP
+    /// reconnect so the runtime drops project-only servers.
     pub fn clear_active_project(&self) {
+        use std::sync::atomic::Ordering;
         *self.runtime.active_project.write() = None;
+        self.runtime.permissions.lock().set_active_project(None);
+        self.runtime
+            .mcp_reconnect_pending
+            .store(true, Ordering::Release);
+    }
+
+    /// Take the MCP reconnect flag (returns `true` once and resets). Called
+    /// by the CLI loop each tick. After taking it, the loop forwards into
+    /// `App.pending_mcp_reconnect = true` so the existing reconnect path
+    /// runs at the next idle tick.
+    pub fn take_mcp_reconnect_pending(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.runtime
+            .mcp_reconnect_pending
+            .swap(false, Ordering::AcqRel)
+    }
+
+    /// Active project's MCP server specs, or empty when no project is active
+    /// or the project carries no MCP entries. Used by the CLI's reconnect
+    /// path to merge into the global spec list (precedence: project > global
+    /// on name collision; matches roadmap §"Name collision precedence").
+    pub fn active_project_mcp_specs(&self) -> Vec<crate::config::McpServerConfig> {
+        let Some(name) = self.active_project_name() else {
+            return Vec::new();
+        };
+        let Some(cfg) = self.lookup_project(&name) else {
+            return Vec::new();
+        };
+        cfg.mcp_servers.values().cloned().collect()
     }
 
     pub fn active_project_name(&self) -> Option<String> {
         self.runtime.active_project.read().clone()
+    }
+
+    /// Append a `Project { name }`-scoped rule to the project's on-disk
+    /// `ProjectConfig.permission_rules` list and rewrite the file. Caller is
+    /// responsible for already inserting the rule into the in-memory
+    /// `PermissionManager` bucket; this helper only mirrors to disk so the
+    /// rule survives restart.
+    ///
+    /// Path: `<dir>/<project>.json`. `dir` defaults to `default_projects_dir`
+    /// when `None` is passed.
+    ///
+    /// Returns `Err` when the project is not registered, or on I/O / JSON
+    /// failure.
+    pub fn persist_project_rule(
+        &self,
+        project: &str,
+        rule: &crate::permissions::PermissionRule,
+        dir: Option<&std::path::Path>,
+    ) -> std::io::Result<()> {
+        let resolved_dir = match dir {
+            Some(d) => d.to_path_buf(),
+            None => crate::project_registry::default_projects_dir().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Cannot resolve ~/.claurst/projects",
+                )
+            })?,
+        };
+        let mut reg = self.runtime.project_registry.write();
+        let cfg = reg.get(project).cloned().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Project '{}' not registered", project),
+            )
+        })?;
+        let mut updated = cfg.clone();
+        updated
+            .permission_rules
+            .push(crate::permissions::SerializedPermissionRule::from(rule));
+        crate::project_registry::ProjectRegistry::save_one(&resolved_dir, &updated)?;
+        reg.insert(updated);
+        Ok(())
+    }
+
+    /// Mirror removal of a project-scoped rule (matched by stable id) to the
+    /// project's on-disk `ProjectConfig.permission_rules`. No-op when the rule
+    /// isn't found in the on-disk list (e.g. the rule was added during the
+    /// current session and never persisted).
+    ///
+    /// Returns `Err` when the project is not registered, or on I/O failure.
+    pub fn persist_remove_project_rule(
+        &self,
+        project: &str,
+        rule_id: uuid::Uuid,
+        dir: Option<&std::path::Path>,
+    ) -> std::io::Result<bool> {
+        let resolved_dir = match dir {
+            Some(d) => d.to_path_buf(),
+            None => crate::project_registry::default_projects_dir().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Cannot resolve ~/.claurst/projects",
+                )
+            })?,
+        };
+        let mut reg = self.runtime.project_registry.write();
+        let cfg = reg.get(project).cloned().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Project '{}' not registered", project),
+            )
+        })?;
+        let mut updated = cfg.clone();
+        let before = updated.permission_rules.len();
+        updated
+            .permission_rules
+            .retain(|s| s.id != Some(rule_id));
+        if updated.permission_rules.len() == before {
+            return Ok(false);
+        }
+        crate::project_registry::ProjectRegistry::save_one(&resolved_dir, &updated)?;
+        reg.insert(updated);
+        Ok(true)
     }
 
     /// Resolve effective `AgentConfig` at spawn time.

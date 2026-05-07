@@ -355,6 +355,78 @@ async fn wait_for_mcp_settlement(
 }
 
 
+/// Phase 11 — spawn a named agent run in the background. Mirrors
+/// `spawn_background_slash_command` but skips the slash-command execution
+/// step: the caller has already resolved the agent name + prompt directly.
+///
+/// Resolves `AgentConfig` via `LiveSession::resolve_agent_config(Some(name))`
+/// at fire time so any ephemeral overrides apply. `AgentRunSource` is
+/// `SlashCommand { name = "agent:<name>" }` so /activity attribution is
+/// distinct from anonymous /btw spawns.
+fn spawn_named_agent_run(
+    agent_name: String,
+    prompt: String,
+    live_session: &claurst_core::live_session::SharedLiveSession,
+    query_config: &claurst_query::QueryConfig,
+    tool_ctx: &claurst_tools::ToolContext,
+    client: Arc<claurst_api::AnthropicClient>,
+    tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
+    result_tx: tokio::sync::mpsc::UnboundedSender<claurst_query::AgentRunResult>,
+    task_tracker: Option<claurst_core::task_tracker::TaskTracker>,
+    event_log: Option<claurst_core::event_log::EventLog>,
+) {
+    use claurst_query::{AgentRunContext, AgentRunRequest, AgentRunSource};
+
+    let agent_config = live_session.resolve_agent_config(Some(&agent_name));
+    let bg_query_config = query_config.clone();
+    let bg_tool_ctx = tool_ctx.clone();
+
+    let run_id = format!("agent:{}", agent_name);
+    let source_name = format!("agent:{}", agent_name);
+
+    // Phase 10: emit AgentSpawned for /activity attribution before the
+    // background_runner emits BackgroundStart.
+    if let Some(log) = event_log.as_ref() {
+        log.push(claurst_core::event_log::Event::now(
+            claurst_core::event_log::EventKind::AgentSpawned {
+                agent_name: Some(agent_name.clone()),
+            },
+            claurst_core::permissions::TaskSource::SlashCommand("agent".to_string()),
+            format!("agent '{}' spawned via /agent run", agent_name),
+        ));
+    }
+
+    tokio::spawn(async move {
+        wait_for_mcp_settlement(
+            bg_tool_ctx.mcp_manager.clone(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        let ctx = AgentRunContext {
+            query_config: bg_query_config,
+            agent_config,
+            tool_ctx: bg_tool_ctx,
+            client,
+            tools,
+            result_tx: Some(result_tx),
+            task_tracker,
+            event_log,
+        };
+        // execute_agent_run_safe: panic boundary so a crash inside the
+        // agent run doesn't take down the tokio worker.
+        let _ = claurst_query::background_runner::execute_agent_run_safe(
+            AgentRunRequest {
+                run_id,
+                source: AgentRunSource::SlashCommand { name: source_name },
+                prompt,
+            },
+            ctx,
+        )
+        .await;
+    });
+}
+
 fn spawn_background_slash_command(
     cmd_name: String,
     input: String,
@@ -364,8 +436,10 @@ fn spawn_background_slash_command(
     client: Arc<claurst_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
     result_tx: tokio::sync::mpsc::UnboundedSender<claurst_query::AgentRunResult>,
+    task_tracker: Option<claurst_core::task_tracker::TaskTracker>,
+    event_log: Option<claurst_core::event_log::EventLog>,
 ) {
-    use claurst_query::{AgentRunContext, AgentRunRequest, AgentRunResult, AgentRunSource, execute_agent_run};
+    use claurst_query::{AgentRunContext, AgentRunRequest, AgentRunResult, AgentRunSource};
 
     let bg_cmd_ctx = claurst_commands::CommandContext {
         config: cmd_ctx.config.clone(),
@@ -377,6 +451,8 @@ fn spawn_background_slash_command(
         remote_session_url: cmd_ctx.remote_session_url.clone(),
         mcp_manager: cmd_ctx.mcp_manager.clone(),
         live_session: cmd_ctx.live_session.clone(),
+        task_tracker: cmd_ctx.task_tracker.clone(),
+        event_log: cmd_ctx.event_log.clone(),
     };
 
     // query_config already has Kairos bootstrap applied from startup — do not re-apply.
@@ -408,10 +484,14 @@ fn spawn_background_slash_command(
                     client,
                     tools,
                     result_tx: Some(result_tx),
-                    task_tracker: None,
-                    event_log: None,
+                    task_tracker,
+                    event_log,
                 };
-                execute_agent_run(AgentRunRequest { run_id, source, prompt: msg }, ctx).await;
+                let _ = claurst_query::background_runner::execute_agent_run_safe(
+                    AgentRunRequest { run_id, source, prompt: msg },
+                    ctx,
+                )
+                .await;
             }
             Some(claurst_commands::CommandResult::Message(msg)) => {
                 let _ = result_tx.send(AgentRunResult { run_id, source, output: msg, is_error: false });
@@ -505,6 +585,8 @@ async fn main() -> anyhow::Result<()> {
                     mcp_manager: None,
                     // Pre-session named-command fast path: no live session yet.
                     live_session: None,
+                    task_tracker: None,
+                    event_log: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -743,15 +825,26 @@ async fn main() -> anyhow::Result<()> {
     // Project registry loaded from `~/.claurst/projects/`; missing dir treated
     // as empty registry (warn-level skip). Pre-session named-command fast path
     // and ACP server path do not bootstrap one — see CommandContext.live_session.
+    // Captured here so it can be replayed into the event log once the log is
+    // constructed below. `None` ⇒ no failures; `Some(vec)` ⇒ project files
+    // skipped during load.
+    let mut project_registry_load_failures: Option<Vec<String>> = None;
     let live_session: claurst_core::live_session::SharedLiveSession = {
         let project_registry = dirs::home_dir()
             .map(|h| h.join(".claurst").join("projects"))
             .and_then(|dir| {
-                claurst_core::project_registry::ProjectRegistry::load_from_dir(&dir)
-                    .map_err(|e| {
+                match claurst_core::project_registry::ProjectRegistry::load_from_dir_with_failures(&dir) {
+                    Ok((reg, failed)) => {
+                        if !failed.is_empty() {
+                            project_registry_load_failures = Some(failed);
+                        }
+                        Some(reg)
+                    }
+                    Err(e) => {
                         warn!(error = %e, "Project registry load failed; using empty registry");
-                    })
-                    .ok()
+                        None
+                    }
+                }
             })
             .unwrap_or_default();
         let perm_manager = claurst_core::permissions::PermissionManager::new(
@@ -783,6 +876,9 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         managed_agent_config: config.managed_agents.clone(),
         completion_notifier: None,
+        // Populated below once tracker + event log are constructed.
+        task_tracker: None,
+        event_log: None,
     };
 
     // Register the cc-query-backed agent runner so TeamCreateTool can spawn real
@@ -936,6 +1032,7 @@ async fn main() -> anyhow::Result<()> {
             has_credentials,
             model_registry,
             live_session,
+            project_registry_load_failures,
         )
         .await
     };
@@ -952,6 +1049,45 @@ async fn connect_mcp_manager_arc(
 
     info!(count = config.mcp_servers.len(), "Connecting to MCP servers");
     let mcp_manager = claurst_mcp::McpManager::connect_all(&config.mcp_servers).await;
+    Some(Arc::new(mcp_manager))
+}
+
+/// Phase 8.5: build the effective MCP spec list by merging global config
+/// servers with the active project's `mcp_servers`. Project entries shadow
+/// global ones with the same name (per roadmap precedence: session > project
+/// > global; session not yet wired here). Returns the merged list ready to
+/// hand to `McpManager::connect_all`.
+fn merged_mcp_specs(
+    config: &Config,
+    live_session: &claurst_core::live_session::SharedLiveSession,
+) -> Vec<claurst_core::config::McpServerConfig> {
+    let project_specs = live_session.active_project_mcp_specs();
+    if project_specs.is_empty() {
+        return config.mcp_servers.clone();
+    }
+    let mut merged: Vec<claurst_core::config::McpServerConfig> = Vec::new();
+    let project_names: std::collections::HashSet<String> =
+        project_specs.iter().map(|s| s.name.clone()).collect();
+    // Keep global entries except those shadowed by project specs.
+    for s in &config.mcp_servers {
+        if !project_names.contains(&s.name) {
+            merged.push(s.clone());
+        }
+    }
+    merged.extend(project_specs);
+    merged
+}
+
+async fn reconnect_mcp_manager_with_project(
+    config: &Config,
+    live_session: &claurst_core::live_session::SharedLiveSession,
+) -> Option<Arc<claurst_mcp::McpManager>> {
+    let merged = merged_mcp_specs(config, live_session);
+    if merged.is_empty() {
+        return None;
+    }
+    info!(count = merged.len(), "Connecting to MCP servers (merged global + project)");
+    let mcp_manager = claurst_mcp::McpManager::connect_all(&merged).await;
     Some(Arc::new(mcp_manager))
 }
 
@@ -1422,6 +1558,7 @@ async fn run_interactive(
     has_credentials: bool,
     model_registry: Arc<claurst_api::ModelRegistry>,
     live_session: claurst_core::live_session::SharedLiveSession,
+    mut project_registry_load_failures: Option<Vec<String>>,
 ) -> anyhow::Result<()> {
     use claurst_commands::{
         execute_command, find_command_execution_policy, CommandContext,
@@ -1675,6 +1812,9 @@ async fn run_interactive(
         remote_session_url: session.remote_session_url.clone(),
         mcp_manager: tool_ctx.mcp_manager.clone(),
         live_session: Some(live_session.clone()),
+        // task_tracker + event_log populated a few lines below once constructed.
+        task_tracker: None,
+        event_log: None,
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
@@ -1688,6 +1828,42 @@ async fn run_interactive(
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
     let (bg_task_tx, mut bg_task_rx) =
         mpsc::unbounded_channel::<claurst_query::AgentRunResult>();
+
+    // Phase 9.5 / Phase 10: process-wide tracker + event log. Cheap to clone
+    // (Arc inside). Populated at every background spawn site so /tasks and
+    // /activity see a live picture.
+    let task_tracker = claurst_core::task_tracker::TaskTracker::new();
+    let event_log = claurst_core::event_log::EventLog::new();
+
+    // Update CommandContext now that we have tracker + log so subsequent
+    // command executions can consult them.
+    cmd_ctx.task_tracker = Some(task_tracker.clone());
+    cmd_ctx.event_log = Some(event_log.clone());
+
+    // Phase 9.5/10: same handles flow into ToolContext so tool dispatch can
+    // emit `ToolCall` events (Started/Succeeded/Failed) and register
+    // `ToolCallTask` entries when needed. Must happen before any tool_ctx
+    // clones reach spawn sites below.
+    tool_ctx.task_tracker = Some(task_tracker.clone());
+    tool_ctx.event_log = Some(event_log.clone());
+
+    // Phase 10: wire event log into the PermissionManager so registering /
+    // resolving pending requests emits PermissionRequested / PermissionDecided.
+    live_session
+        .runtime
+        .permissions
+        .lock()
+        .set_event_log(event_log.clone());
+
+    // Phase 10: replay project-registry partial-load failures into the event
+    // log so `/activity` surfaces them post-bootstrap.
+    if let Some(failed) = project_registry_load_failures.take() {
+        event_log.push(claurst_core::event_log::Event::now(
+            claurst_core::event_log::EventKind::SnapshotPartialLoad { failed: failed.clone() },
+            claurst_core::permissions::TaskSource::System,
+            format!("project registry: {} file(s) skipped", failed.len()),
+        ));
+    }
 
     // Tracks last bridge pointer write time for debouncing (write at most every 30s).
     let mut last_bridge_write = chrono::Utc::now() - chrono::Duration::hours(24);
@@ -1704,6 +1880,8 @@ async fn run_interactive(
             Some(bg_task_tx.clone()),
             cron_cancel.clone(),
             Some(live_session.clone()),
+            Some(task_tracker.clone()),
+            Some(event_log.clone()),
         );
     } else {
         debug!("Kairos tools disabled; cron scheduler not started");
@@ -1718,6 +1896,8 @@ async fn run_interactive(
             tools_arc.clone(),
             bg_task_tx.clone(),
             proactive_cancel.clone(),
+            Some(task_tracker.clone()),
+            Some(event_log.clone()),
         );
     }
 
@@ -1906,6 +2086,8 @@ async fn run_interactive(
                                     client.clone(),
                                     tools_arc.clone(),
                                     bg_task_tx.clone(),
+                                    Some(task_tracker.clone()),
+                                    Some(event_log.clone()),
                                 );
 
                                 app.notifications.push(
@@ -1966,6 +2148,13 @@ async fn run_interactive(
                                     app.hooks_config_menu.open();
                                     app.status_message =
                                         Some("Hooks configuration browser".to_string());
+                                }
+                                Some(CommandResult::OpenActivityOverlay) => {
+                                    // Phase 10: open the /activity scrollable modal.
+                                    // The CLI tick refreshes app.activity_events from
+                                    // event_log so the modal renders live data.
+                                    app.activity_events = event_log.snapshot();
+                                    app.activity_overlay.open();
                                 }
                                 Some(CommandResult::ResumeSession(resumed_session)) => {
                                     session = resumed_session;
@@ -2129,6 +2318,25 @@ async fn run_interactive(
                                 Some(CommandResult::UserMessage(msg)) => {
                                     // Queue a user-visible turn for the model.
                                     submit_user_msg = Some(msg);
+                                }
+                                Some(CommandResult::SpawnNamedAgent { agent_name, prompt }) => {
+                                    spawn_named_agent_run(
+                                        agent_name.clone(),
+                                        prompt,
+                                        &live_session,
+                                        &base_query_config,
+                                        &tool_ctx,
+                                        client.clone(),
+                                        tools_arc.clone(),
+                                        bg_task_tx.clone(),
+                                        Some(task_tracker.clone()),
+                                        Some(event_log.clone()),
+                                    );
+                                    app.notifications.push(
+                                        NotificationKind::Info,
+                                        format!("Spawned agent '{}' in background.", agent_name),
+                                        Some(4),
+                                    );
                                 }
                                 Some(CommandResult::StartOAuthFlow(with_claude_ai)) => {
                                     claurst_tui::restore_terminal(&mut terminal).ok();
@@ -2333,7 +2541,18 @@ async fn run_interactive(
                         });
 
                         // Store the Arc so we can read messages after task completes
-                        current_query = Some((handle, msgs_arc));
+                        // Phase 10: emit TurnStart for /activity timeline.
+                        event_log.push(claurst_core::event_log::Event::now(
+                            claurst_core::event_log::EventKind::TurnStart,
+                            claurst_core::permissions::TaskSource::MainSession,
+                            "user turn started",
+                        ));
+                        event_log.push(claurst_core::event_log::Event::now(
+                    claurst_core::event_log::EventKind::TurnStart,
+                    claurst_core::permissions::TaskSource::MainSession,
+                    "user turn started",
+                ));
+                current_query = Some((handle, msgs_arc));
                         continue;
                     }
 
@@ -2515,6 +2734,11 @@ async fn run_interactive(
                     *msgs_arc_clone.lock().await = msgs;
                     outcome
                 });
+                event_log.push(claurst_core::event_log::Event::now(
+                    claurst_core::event_log::EventKind::TurnStart,
+                    claurst_core::permissions::TaskSource::MainSession,
+                    "user turn started",
+                ));
                 current_query = Some((handle, msgs_arc));
             }
         }
@@ -2667,7 +2891,18 @@ async fn run_interactive(
                             *msgs_arc_clone.lock().await = msgs;
                             outcome
                         });
-                        current_query = Some((handle, msgs_arc));
+                        // Phase 10: emit TurnStart for /activity timeline.
+                        event_log.push(claurst_core::event_log::Event::now(
+                            claurst_core::event_log::EventKind::TurnStart,
+                            claurst_core::permissions::TaskSource::MainSession,
+                            "user turn started",
+                        ));
+                        event_log.push(claurst_core::event_log::Event::now(
+                    claurst_core::event_log::EventKind::TurnStart,
+                    claurst_core::permissions::TaskSource::MainSession,
+                    "user turn started",
+                ));
+                current_query = Some((handle, msgs_arc));
                     }
                     Ok(TuiBridgeEvent::Cancelled) => {
                         if app.is_streaming {
@@ -2775,6 +3010,11 @@ async fn run_interactive(
                     *msgs_arc_clone.lock().await = msgs;
                     outcome
                 });
+                event_log.push(claurst_core::event_log::Event::now(
+                    claurst_core::event_log::EventKind::TurnStart,
+                    claurst_core::permissions::TaskSource::MainSession,
+                    "user turn started",
+                ));
                 current_query = Some((handle, msgs_arc));
                 break; // process one prompt per frame
             }
@@ -2872,6 +3112,12 @@ async fn run_interactive(
         // Refresh task list if the overlay is visible.
         if app.tasks_overlay.visible {
             app.tasks_overlay.refresh_tasks(&claurst_tools::TASK_STORE);
+        }
+
+        // Phase 10: refresh activity-event snapshot each tick when the modal
+        // is visible so new events surface live without close/reopen.
+        if app.activity_overlay.visible {
+            app.activity_events = event_log.snapshot();
         }
 
         // Check if the background update task has reported a result.
@@ -3043,6 +3289,12 @@ async fn run_interactive(
             if let Some((handle, msgs_arc)) = current_query.take() {
                 // Get the outcome (ignore errors for now)
                 let _ = handle.await;
+                // Phase 10: emit TurnEnd for /activity timeline.
+                event_log.push(claurst_core::event_log::Event::now(
+                    claurst_core::event_log::EventKind::TurnEnd,
+                    claurst_core::permissions::TaskSource::MainSession,
+                    "user turn ended",
+                ));
                 // Sync the updated conversation back to our local vector
                 messages = msgs_arc.lock().await.clone();
                 session.messages = messages.clone();
@@ -3105,8 +3357,24 @@ async fn run_interactive(
             }
         }
 
+        // Phase 8.5: forward LiveSession's MCP-reconnect signal (set by
+        // `/project switch` and `clear_active_project`) into the App's
+        // existing reconnect path so the merged global+project specs land
+        // in the runtime.
+        if live_session.take_mcp_reconnect_pending() {
+            app.pending_mcp_reconnect = true;
+        }
+
         if !app.is_streaming && current_query.is_none() && app.take_pending_mcp_reconnect() {
-            let new_mcp_manager = connect_mcp_manager_arc(&cmd_ctx.config).await;
+            // Window invariant: tool calls during the rebuild window observe
+            // the empty MCP map and return "MCP server not yet connected,
+            // retry". The full atomic-replace protocol (snapshot → swap →
+            // release locks → drop old → spawn rebuild → insert via short
+            // write-locks) lands when `runtime.mcp` becomes the unified
+            // registry. For now, the reconnect tears down the old manager
+            // wholesale and rebuilds.
+            let new_mcp_manager =
+                reconnect_mcp_manager_with_project(&cmd_ctx.config, &live_session).await;
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
             tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
@@ -3118,16 +3386,46 @@ async fn run_interactive(
                 .as_ref()
                 .map(|manager| manager.server_count())
                 .unwrap_or(0);
-            app.status_message = Some(if cmd_ctx.config.mcp_servers.is_empty() {
-                "No MCP servers configured.".to_string()
-            } else {
-                format!(
+            let active = live_session.active_project_name();
+            app.status_message = Some(match active.as_deref() {
+                Some(p) if connected > 0 => format!(
+                    "Reconnected MCP runtime for project '{}' ({} server{}).",
+                    p,
+                    connected,
+                    if connected == 1 { "" } else { "s" }
+                ),
+                Some(p) => format!(
+                    "MCP runtime: project '{}' has no servers configured.",
+                    p
+                ),
+                None if connected > 0 => format!(
                     "Reconnected MCP runtime ({} connected server{}).",
                     connected,
                     if connected == 1 { "" } else { "s" }
-                )
+                ),
+                None => "No MCP servers configured.".to_string(),
             });
         }
+
+        // Phase 10: refresh recent-activity surface from event log so the
+        // welcome screen and status line reflect live state.
+        app.recent_activity = event_log.most_recent().map(|e| {
+            let src = match &e.source {
+                claurst_core::permissions::TaskSource::MainSession => "main".to_string(),
+                claurst_core::permissions::TaskSource::SlashCommand(n) => format!("/{}", n),
+                claurst_core::permissions::TaskSource::Cron(id) => format!("cron:{}", id),
+                claurst_core::permissions::TaskSource::Proactive => "proactive".to_string(),
+                claurst_core::permissions::TaskSource::Agent(n) => format!("agent:{}", n),
+                claurst_core::permissions::TaskSource::BgLoop(n) => format!("bg:{}", n),
+                claurst_core::permissions::TaskSource::System => "system".to_string(),
+            };
+            format!(
+                "{}  {}  {}",
+                e.at.format("%H:%M:%S"),
+                src,
+                e.summary
+            )
+        });
 
         if app.should_quit {
             break 'main;
@@ -3139,6 +3437,15 @@ async fn run_interactive(
     if let Some(runtime) = bridge_runtime.take() {
         runtime.cancel.cancel();
     }
+
+    // Phase 10: flush event log to JSONL on graceful shutdown. Best-effort;
+    // a write error is logged but does not block exit.
+    match event_log.flush_to_jsonl() {
+        Ok(n) if n > 0 => debug!(events = n, "Event log flushed to JSONL"),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "Failed to flush event log"),
+    }
+
     restore_terminal(&mut terminal)?;
     Ok(())
 }

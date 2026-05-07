@@ -12,9 +12,9 @@
 //!   Remainder: the prompt text injected into the system prompt
 
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -206,19 +206,15 @@ static RUNTIME_STYLES: Lazy<Mutex<Vec<OutputStyleDef>>> =
 /// `find_style_runtime`.  Duplicate names are silently ignored so that
 /// hot-reloading a plugin does not double-register styles.
 pub fn register_runtime_style(style: OutputStyleDef) {
-    if let Ok(mut list) = RUNTIME_STYLES.lock() {
-        if !list.iter().any(|s| s.name == style.name) {
-            list.push(style);
-        }
+    let mut list = RUNTIME_STYLES.lock();
+    if !list.iter().any(|s| s.name == style.name) {
+        list.push(style);
     }
 }
 
 /// Return all runtime-registered styles.
 pub fn runtime_styles() -> Vec<OutputStyleDef> {
-    RUNTIME_STYLES
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default()
+    RUNTIME_STYLES.lock().clone()
 }
 
 /// Like `all_styles`, but also includes runtime-registered plugin styles.
@@ -242,10 +238,9 @@ pub fn find_style_runtime<'a>(
         return Some(std::borrow::Cow::Borrowed(s));
     }
     // Fall back to runtime registry.
-    if let Ok(rt) = RUNTIME_STYLES.lock() {
-        if let Some(s) = rt.iter().find(|s| s.name == name) {
-            return Some(std::borrow::Cow::Owned(s.clone()));
-        }
+    let rt = RUNTIME_STYLES.lock();
+    if let Some(s) = rt.iter().find(|s| s.name == name) {
+        return Some(std::borrow::Cow::Owned(s.clone()));
     }
     None
 }

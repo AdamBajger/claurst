@@ -93,10 +93,18 @@ impl ProjectRegistry {
     /// Missing directory is treated as "empty registry" — not an error. Files
     /// that fail to parse are skipped with a warning; the rest still load.
     pub fn load_from_dir(dir: &Path) -> std::io::Result<Self> {
+        Self::load_from_dir_with_failures(dir).map(|(reg, _)| reg)
+    }
+
+    /// Same as `load_from_dir` but also returns the list of file names that
+    /// failed to read or parse. Useful for emitting `SnapshotPartialLoad`
+    /// events at startup so the user knows some project configs were skipped.
+    pub fn load_from_dir_with_failures(dir: &Path) -> std::io::Result<(Self, Vec<String>)> {
         let mut reg = Self::new();
+        let mut failed: Vec<String> = Vec::new();
         let entries = match std::fs::read_dir(dir) {
             Ok(it) => it,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(reg),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((reg, failed)),
             Err(e) => return Err(e),
         };
 
@@ -105,10 +113,16 @@ impl ProjectRegistry {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
+            let display = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string();
             let bytes = match std::fs::read(&path) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "Skipping project file: read failed");
+                    failed.push(display);
                     continue;
                 }
             };
@@ -118,11 +132,12 @@ impl ProjectRegistry {
                 }
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "Skipping project file: parse failed");
+                    failed.push(display);
                 }
             }
         }
 
-        Ok(reg)
+        Ok((reg, failed))
     }
 
     /// Persist a single project to `<dir>/<name>.json`. Parent dir created if

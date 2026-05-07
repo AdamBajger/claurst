@@ -75,7 +75,7 @@ pub use types::{
     ContentBlock, ImageSource, DocumentSource, CitationsConfig, Message, MessageContent,
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
-pub use config::{AgentConfig, AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
+pub use config::{AgentConfig, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
 
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
@@ -798,7 +798,6 @@ pub mod config {
     /// Back-compat alias: keeps existing call sites compiling while Phase 8 plumbs
     /// the new name through. Delete the alias in a follow-up phase once all
     /// callers import `AgentConfig` directly.
-    pub type AgentDefinition = AgentConfig;
 
     impl Default for AgentConfig {
         fn default() -> Self {
@@ -1025,7 +1024,7 @@ pub mod config {
         pub commands: HashMap<String, CommandTemplate>,
         /// Named agent definitions (copied from Settings on load).
         #[serde(default)]
-        pub agents: HashMap<String, AgentDefinition>,
+        pub agents: HashMap<String, AgentConfig>,
         /// Skill-discovery configuration (copied from Settings on load).
         #[serde(default)]
         pub skills: SkillsConfig,
@@ -1135,7 +1134,7 @@ pub mod config {
         pub formatter: HashMap<String, FormatterConfig>,
         /// Named agent definitions (overrides built-in defaults).
         #[serde(default)]
-        pub agents: HashMap<String, AgentDefinition>,
+        pub agents: HashMap<String, AgentConfig>,
         /// Skill-discovery configuration (extra paths and git URLs).
         #[serde(default)]
         pub skills: SkillsConfig,
@@ -1186,16 +1185,16 @@ pub mod config {
 
     /// Return the three built-in named agent definitions.
     /// User-defined agents in `settings.json` can override these by name.
-    pub fn default_agents() -> HashMap<String, AgentDefinition> {
+    pub fn default_agents() -> HashMap<String, AgentConfig> {
         let mut m = HashMap::new();
-        m.insert("build".to_string(), AgentDefinition {
+        m.insert("build".to_string(), AgentConfig {
             description: Some("Full-access agent for implementing features and fixing bugs".to_string()),
             append_system_prompt: Some("You are the build agent. You have full access to read, write, and execute. Focus on implementing the requested changes completely and correctly.".to_string()),
             access: "full".to_string(),
             color: Some("cyan".to_string()),
             ..Default::default()
         });
-        m.insert("plan".to_string(), AgentDefinition {
+        m.insert("plan".to_string(), AgentConfig {
             description: Some("Read-only agent for analyzing code and planning changes".to_string()),
             append_system_prompt: Some("You are the plan agent. You can read files and analyze code but cannot write files or execute commands. Focus on understanding the codebase and describing what changes should be made.".to_string()),
             access: "read-only".to_string(),
@@ -1203,7 +1202,7 @@ pub mod config {
             color: Some("yellow".to_string()),
             ..Default::default()
         });
-        m.insert("explore".to_string(), AgentDefinition {
+        m.insert("explore".to_string(), AgentConfig {
             description: Some("Fast search-only agent for code exploration".to_string()),
             append_system_prompt: Some("You are the explore agent. You can search and read files. Focus on quickly finding relevant code and answering questions about the codebase.".to_string()),
             access: "search-only".to_string(),

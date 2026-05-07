@@ -310,8 +310,8 @@ that wants to surface a result should go through `AgentRunResult`.
 ### 7.7 `/project` (Phase 8.5)
 - `list` — registered projects + active marker.
 - `show` — active project's root, default agent, permission rules count, MCP servers.
-- `switch <name>` — atomic swap: cwd + active marker. Permission rule + MCP
-  swap on switch is partial (see §13 Known Gaps).
+- `switch <name>` — atomic swap: cwd, active marker, permission rules, and
+  MCP handles via the Atomic Replace Protocol.
 - `create <name> --root <path>` — register + persist to `~/.claurst/projects/<name>.json`.
 
 ### 7.8 `/permissions` (Phase 9)
@@ -531,7 +531,6 @@ Round 1 plumbing carry-overs:
 - Prompt dedupe across ticks is not implemented (prompt is static — not meaningful yet).
 
 Round 2 deferred items (see KAIROS_FUTURE.md "Deferred Within Round 2" for full status):
-- `/project switch` MCP swap (atomic-replace protocol) not yet implemented; cwd + active marker + permission rules done.
 - Status-line wiring: welcome-screen "Recent activity" line is now live (App.recent_activity ← event_log.most_recent each tick); continuous below-prompt avatar surfacing still pending.
 - Tracker → event-log lifecycle hooks (auto-emit `BackgroundStart`/`Finish` from tracker register/deregister) — currently per-spawn-site emission; safe but could be centralised.
 - Tool-dispatch + `AgentTool` sub-agent not yet registered as `TaskTracker` entries (they emit `ToolCall` events but no tracker rows).

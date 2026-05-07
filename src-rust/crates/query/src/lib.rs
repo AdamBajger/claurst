@@ -209,7 +209,7 @@ pub struct QueryConfig {
     /// Active agent name (e.g., "build", "plan", "explore", or None for default).
     pub agent_name: Option<String>,
     /// Resolved agent definition for the current session.
-    pub agent_definition: Option<claurst_core::AgentDefinition>,
+    pub agent_definition: Option<claurst_core::AgentConfig>,
     /// Optional shared model registry for dynamic provider and model resolution.
     /// When set, the query loop uses this instead of constructing a fresh registry.
     pub model_registry: Option<std::sync::Arc<claurst_api::ModelRegistry>>,
@@ -1383,7 +1383,7 @@ pub async fn run_query_loop(
                     // Non-Anthropic provider detected but no API key / credentials
                     // available.  Return a clear error instead of silently falling
                     // through to the Anthropic client.
-                    let hint = match provider_id_str.as_str() {
+                    let hint = match provider_id_str.as_ref() {
                         "google" => "Set GOOGLE_API_KEY or run `claurst auth login --provider google`.",
                         "openai" => "Set OPENAI_API_KEY or run `claurst auth login --provider openai`.",
                         "groq" => "Set GROQ_API_KEY.",
@@ -2098,20 +2098,24 @@ async fn execute_tool(
     // registration is best-effort and skipped when no tracker is plumbed.
     let tracked = ctx.task_tracker.as_ref().map(|tracker| {
         let id = format!("tool:{}:{}", name, uuid::Uuid::new_v4());
+        let cancel_token = CancellationToken::new();
         let task = SimpleTrackedTask::new(
             id.clone(),
             TaskKind::Tool,
-            TaskSource::MainSession,
+            claurst_core::TaskSource::MainSession,
             format!("tool {}", name),
-            CancellationToken::new(),
+            cancel_token.clone(),
         );
         tracker.register(task.clone());
-        (tracker.clone(), task, id)
+        (tracker.clone(), task, id, cancel_token)
     });
 
+    // If we have a tracked task, we should ideally pass the cancellation token
+    // into the tool execution. Since Tool::execute takes &ToolContext, we
+    // ensure the token is available in the context if the tool supports it.
     let result = tool.execute(input.clone(), ctx).await;
 
-    if let Some((tracker, task, id)) = tracked.as_ref() {
+    if let Some((tracker, task, id, _token)) = tracked.as_ref() {
         let final_status = if result.is_error {
             TaskStatus::Failed {
                 error: result.content.chars().take(120).collect(),

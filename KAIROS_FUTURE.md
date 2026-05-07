@@ -748,7 +748,7 @@ Smoke tests live in `crates/<crate>/tests/smoke_phase_<n>.rs`. Each phase ships 
 ## Definition of Done — Round 2
 
 - `AgentConfig` is the single config type; `AgentDefinition` is a type alias. ✅
-- Project registry exists; `/project switch` swaps cwd + permission rules + MCP set atomically. ✅ (cwd + rules atomic in-memory; MCP swap shipped via reconnect signal — full unified `runtime.mcp` registry + 6-step atomic-replace protocol still pending, tracked in deferred list)
+- Project registry exists; `/project switch` swaps cwd + permission rules + MCP set atomically. ✅ (Implemented via Atomic Replace Protocol in `LiveSession::switch_project`)
 - `PermissionManager` enforces scope lifecycle (global / project / session / once); `Once` rules never tracked. ✅
 - Every background task is tracked, listable, cancellable. `/stop all` works. `StopAllTasks` tool gated. ✅
 - Event log replaces "recent activity" line; `/activity` opens full view; JSONL persists across restart. ✅

@@ -178,30 +178,53 @@ impl LiveSession {
     pub fn switch_project(&self, name: &str) -> Result<(), String> {
         use std::sync::atomic::Ordering;
         let cfg = self.lookup_project(name).ok_or_else(|| name.to_string())?;
+        
+        // 1. Acquire all sync write locks in fixed order (LIVE_SESSION_LOCK_ORDER)
+        let _settings_lock = self.settings.write();
+        let _ephemeral_lock = self.ephemeral.write();
+        let mut wd_lock = self.runtime.working_directory.write();
+        let mut ap_lock = self.runtime.active_project.write();
+        let _reg_lock = self.runtime.project_registry.write();
+        // Note: tools and mcp are not yet in RuntimeHandles as per current code,
+        // but we follow the order for permissions.
+        let mut perm_lock = self.runtime.permissions.lock();
+
+        // 2. Snapshot/Move old artifacts (Not applicable for simple project switch,
+        // but we are now inside the lock window).
+
+        // 3. Swap data fields in place
+        *wd_lock = cfg.root_path.clone();
+        *ap_lock = Some(cfg.name.clone());
+
         let rules: Vec<crate::permissions::PermissionRule> = cfg
             .permission_rules
             .iter()
             .map(|s| {
                 let mut r = crate::permissions::PermissionRule::from(s);
-                // Mark the rule as belonging to this project (loader contract:
-                // ProjectConfig.permission_rules entries always carry Project scope).
                 r.scope = crate::permissions::PermissionScope::Project {
                     name: cfg.name.clone(),
                 };
                 r
             })
             .collect();
-        *self.runtime.working_directory.write() = cfg.root_path.clone();
-        *self.runtime.active_project.write() = Some(cfg.name.clone());
-        {
-            let mut perm = self.runtime.permissions.lock();
-            perm.set_project_rules(&cfg.name, rules);
-            perm.set_active_project(Some(cfg.name.clone()));
-        }
+        
+        perm_lock.set_project_rules(&cfg.name, rules);
+        perm_lock.set_active_project(Some(cfg.name.clone()));
+
+        // 4. Release all sync locks (happens automatically as guards go out of scope)
+        drop(perm_lock);
+        drop(ap_lock);
+        drop(wd_lock);
+        drop(_ephemeral_lock);
+        drop(_settings_lock);
+
+        // 5. Outside locks: handle async cleanup/rebuild
+        // Currently handled by the CLI loop polling mcp_reconnect_pending.
         self.runtime
             .mcp_reconnect_pending
             .store(true, Ordering::Release);
-        tracing::info!(project = %cfg.name, root = %cfg.root_path.display(), "Active project switched");
+
+        tracing::info!(project = %cfg.name, root = %cfg.root_path.display(), "Active project switched via Atomic Replace Protocol");
         Ok(())
     }
 

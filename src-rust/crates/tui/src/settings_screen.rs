@@ -91,9 +91,9 @@ pub struct SettingsScreen {
 impl SettingsScreen {
     pub fn new() -> Self {
         let settings_snapshot = Settings::load_sync().unwrap_or_default();
-        let auto_compact_enabled = settings_snapshot.config.auto_compact;
+        let auto_compact_enabled = settings_snapshot.auto_compact;
         let auto_compact_threshold = {
-            let t = settings_snapshot.config.compact_threshold;
+            let t = settings_snapshot.compact_threshold;
             if t > 0.0 { (t * 100.0).round() as u8 } else { 95 }
         };
         Self {
@@ -128,13 +128,13 @@ impl SettingsScreen {
         self.auto_compact_enabled = read_setting_bool(
             &self.settings_snapshot,
             "autoCompact",
-            self.settings_snapshot.config.auto_compact,
+            self.settings_snapshot.auto_compact,
         );
         self.auto_compact_threshold = read_setting_u8(
             &self.settings_snapshot,
             "autoCompactThreshold",
             {
-                let t = self.settings_snapshot.config.compact_threshold;
+                let t = self.settings_snapshot.compact_threshold;
                 if t > 0.0 { (t * 100.0).round() as u8 } else { 95 }
             },
         );
@@ -261,7 +261,7 @@ impl SettingsScreen {
             }
         }
         // Update snapshot and persist
-        self.settings_snapshot.config = config.clone();
+        self.settings_snapshot = config.clone();
         let _ = self.settings_snapshot.save_sync();
         self.pending_changes.clear();
     }
@@ -488,7 +488,7 @@ fn render_tab_content(frame: &mut Frame, screen: &SettingsScreen, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn build_general_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
-    let cfg = &screen.settings_snapshot.config;
+    let cfg = &screen.settings_snapshot;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     lines.push(section_header("General Settings"));
@@ -515,7 +515,7 @@ fn build_general_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
     // Max tokens
     let max_tokens_val = cfg
         .max_tokens
-        .map(|n| n.to_string())
+        .map(|n: u32| n.to_string())
         .unwrap_or_else(|| claurst_core::constants::DEFAULT_MAX_TOKENS.to_string());
     lines.extend(field_lines(
         "max_tokens",
@@ -549,7 +549,7 @@ fn build_general_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
     let wd = cfg
         .project_dir
         .as_ref()
-        .map(|p| p.display().to_string())
+        .map(|p: &std::path::PathBuf| p.display().to_string())
         .unwrap_or_else(|| std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "(unknown)".to_string()));
@@ -594,7 +594,7 @@ fn build_general_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
 // ---------------------------------------------------------------------------
 
 fn build_display_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
-    let cfg = &screen.settings_snapshot.config;
+    let cfg = &screen.settings_snapshot;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     lines.push(section_header("Display Settings"));
@@ -761,7 +761,7 @@ fn build_privacy_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
     privacy_toggle_lines(
         &mut lines,
         "Verbose Logging",
-        screen.settings_snapshot.config.verbose,
+        screen.settings_snapshot.verbose,
         "Logs additional debug information locally (--verbose flag).",
     );
 
@@ -806,7 +806,7 @@ fn privacy_toggle_lines(lines: &mut Vec<Line<'static>>, name: &str, enabled: boo
 // ---------------------------------------------------------------------------
 
 fn build_advanced_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
-    let cfg = &screen.settings_snapshot.config;
+    let cfg = &screen.settings_snapshot;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     lines.push(section_header("Advanced Settings"));
@@ -846,13 +846,11 @@ fn build_advanced_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
             _ => false,
         })
     };
-    let key_source = if cfg.api_key.as_ref().is_some_and(|key| !key.is_empty()) {
-        "settings.api_key (masked)".to_string()
-    } else if cfg
+    let key_source = if cfg
         .provider_configs
         .get(active_provider)
         .and_then(|provider| provider.api_key.as_ref())
-        .is_some_and(|key| !key.is_empty())
+        .is_some_and(|key: &String| !key.is_empty())
     {
         format!("settings.provider_configs.{active_provider}.api_key (masked)")
     } else if let Some(env_var) = env_source {
@@ -863,8 +861,7 @@ fn build_advanced_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
         "not set".to_string()
     };
     lines.push(label_value_line("API Key Source", &key_source));
-    if cfg.api_key.is_some()
-        || cfg
+    if cfg
             .provider_configs
             .get(active_provider)
             .and_then(|provider| provider.api_key.as_ref())
@@ -1277,7 +1274,7 @@ pub fn handle_settings_key(
                 // Start editing the first editable text field
                 match &screen.active_tab {
                     SettingsTab::General => {
-                        let cfg = &screen.settings_snapshot.config;
+                        let cfg = &screen.settings_snapshot;
                         let model_val = cfg.model.clone().unwrap_or_else(|| {
                             claurst_core::constants::DEFAULT_MODEL.to_string()
                         });

@@ -117,10 +117,10 @@ pub fn custom_openai_with_url(base_url: impl Into<String>) -> OpenAiCompatProvid
 pub fn custom_openai() -> OpenAiCompatProvider {
     let settings = Settings::load_sync().unwrap_or_default();
     let base_url = settings
-        .providers
+        .provider_configs
         .get("custom-openai")
         .and_then(|config| config.api_base.as_deref())
-        .filter(|url| !url.trim().is_empty())
+        .filter(|url: &&str| !url.trim().is_empty())
         .unwrap_or("http://localhost:11434/v1");
 
     custom_openai_with_url(base_url)

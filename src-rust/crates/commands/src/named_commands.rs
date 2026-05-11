@@ -165,8 +165,8 @@ impl NamedCommand for AddDirCommand {
             }
         };
 
-        if !settings.config.workspace_paths.iter().any(|p| p == &abs_path) {
-            settings.config.workspace_paths.push(abs_path.clone());
+        if !settings.workspace_paths.iter().any(|p| p == &abs_path) {
+            settings.workspace_paths.push(abs_path.clone());
             if let Err(e) = settings.save_sync() {
                 return CommandResult::Error(format!(
                     "Added {} for this session, but failed to save settings: {}",
@@ -1110,8 +1110,13 @@ mod tests {
     use claurst_core::cost::CostTracker;
 
     fn make_ctx() -> CommandContext {
+        let config = claurst_core::config::Config::default();
+        let resolver = claurst_core::config::ConfigResolver::from_global(
+            claurst_core::config::GlobalScope { config: config.clone() },
+        );
         CommandContext {
-            config: claurst_core::config::Config::default(),
+            config,
+            resolver,
             cost_tracker: CostTracker::new(),
             messages: vec![],
             working_dir: std::path::PathBuf::from("."),

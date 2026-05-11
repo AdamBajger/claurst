@@ -5,7 +5,7 @@
 // Each command is a struct implementing the `SlashCommand` trait.
 
 use async_trait::async_trait;
-use claurst_core::config::{Config, Settings, Theme};
+use claurst_core::config::{Config, ConfigResolver, Settings, Theme};
 use claurst_core::cost::CostTracker;
 use claurst_core::types::{ContentBlock, Message};
 use std::collections::BTreeMap;
@@ -20,6 +20,9 @@ use std::path::PathBuf;
 /// Context available to every slash command.
 pub struct CommandContext {
     pub config: Config,
+    /// Layered config resolver (once → session → project → global).
+    /// Use for reads; mutate `config` for writes then return `ConfigChange`.
+    pub resolver: ConfigResolver,
     pub cost_tracker: Arc<CostTracker>,
     pub messages: Vec<Message>,
     pub working_dir: std::path::PathBuf,
@@ -831,7 +834,7 @@ impl SlashCommand for ConfigCommand {
                 "model" => {
                     let mut new_config = ctx.config.clone();
                     new_config.model = None;
-                    if let Err(err) = save_settings_mutation(|settings| settings.config.model = None)
+                    if let Err(err) = save_settings_mutation(|settings| settings.model = None)
                     {
                         return CommandResult::Error(format!(
                             "Failed to save configuration: {}",
@@ -847,7 +850,7 @@ impl SlashCommand for ConfigCommand {
                     let mut new_config = ctx.config.clone();
                     new_config.output_style = None;
                     if let Err(err) =
-                        save_settings_mutation(|settings| settings.config.output_style = None)
+                        save_settings_mutation(|settings| settings.output_style = None)
                     {
                         return CommandResult::Error(format!(
                             "Failed to save configuration: {}",
@@ -863,12 +866,24 @@ impl SlashCommand for ConfigCommand {
             };
         }
 
+        if args == "commit" {
+            let cfg = ctx.config.clone();
+            return match cfg.save().await {
+                Ok(_) => CommandResult::Message(
+                    "Configuration committed to global settings.".to_string(),
+                ),
+                Err(e) => CommandResult::Error(format!("Failed to commit config: {}", e)),
+            };
+        }
+
         let mut parts = args.splitn(3, ' ');
         let command = parts.next().unwrap_or_default();
         let key = parts.next().unwrap_or_default().trim();
         let value = parts.next().unwrap_or_default().trim();
         if command != "set" || key.is_empty() || value.is_empty() {
-            return CommandResult::Error("Usage: /config set <key> <value>".to_string());
+            return CommandResult::Error(
+                "Usage: /config set <key> <value>  or  /config commit".to_string(),
+            );
         }
 
         match key {
@@ -881,7 +896,7 @@ impl SlashCommand for ConfigCommand {
                 let mut new_config = ctx.config.clone();
                 new_config.theme = theme.clone();
                 if let Err(err) =
-                    save_settings_mutation(|settings| settings.config.theme = theme.clone())
+                    save_settings_mutation(|settings| settings.theme = theme.clone())
                 {
                     return CommandResult::Error(format!("Failed to save configuration: {}", err));
                 }
@@ -905,7 +920,7 @@ impl SlashCommand for ConfigCommand {
                 new_config.output_style =
                     (normalized != "default").then(|| normalized.clone());
                 if let Err(err) = save_settings_mutation(|settings| {
-                    settings.config.output_style =
+                    settings.output_style =
                         (normalized != "default").then(|| normalized.clone());
                 }) {
                     return CommandResult::Error(format!("Failed to save configuration: {}", err));
@@ -928,10 +943,9 @@ impl SlashCommand for ConfigCommand {
                     new_config.provider = Some(provider.clone());
                 }
                 if let Err(err) = save_settings_mutation(|settings| {
-                    settings.config.model = Some(value.to_string());
+                    settings.model = Some(value.to_string());
                     if let Some(ref provider) = inferred_provider {
                         settings.provider = Some(provider.clone());
-                        settings.config.provider = Some(provider.clone());
                     }
                 }) {
                     return CommandResult::Error(format!("Failed to save configuration: {}", err));
@@ -962,7 +976,7 @@ impl SlashCommand for ConfigCommand {
                 let mut new_config = ctx.config.clone();
                 new_config.permission_mode = mode.clone();
                 if let Err(err) = save_settings_mutation(|settings| {
-                    settings.config.permission_mode = mode.clone();
+                    settings.permission_mode = mode.clone();
                 }) {
                     return CommandResult::Error(format!("Failed to save configuration: {}", err));
                 }
@@ -1061,7 +1075,7 @@ impl SlashCommand for ThemeCommand {
 
         let mut new_config = ctx.config.clone();
         new_config.theme = theme.clone();
-        if let Err(err) = save_settings_mutation(|settings| settings.config.theme = theme.clone())
+        if let Err(err) = save_settings_mutation(|settings| settings.theme = theme.clone())
         {
             return CommandResult::Error(format!("Failed to save theme: {}", err));
         }
@@ -1116,7 +1130,7 @@ impl SlashCommand for OutputStyleCommand {
         let mut new_config = ctx.config.clone();
         new_config.output_style = (normalized != "default").then(|| normalized.clone());
         if let Err(err) = save_settings_mutation(|settings| {
-            settings.config.output_style =
+            settings.output_style =
                 (normalized != "default").then(|| normalized.clone());
         }) {
             return CommandResult::Error(format!("Failed to save configuration: {}", err));
@@ -2291,11 +2305,16 @@ impl SlashCommand for LogoutCommand {
         }
         // Also clear any API key stored in settings
         let mut settings = claurst_core::config::Settings::load().await.unwrap_or_default();
-        settings.config.api_key = None;
+        let active_provider = settings.selected_provider_id().to_string();
+        if let Some(cfg) = settings.provider_configs.get_mut(&active_provider) {
+            cfg.api_key = None;
+        }
         if let Err(e) = settings.save().await {
             return CommandResult::Error(format!("Failed to update settings: {}", e));
         }
-        ctx.config.api_key = None;
+        if let Some(cfg) = ctx.config.provider_configs.get_mut(&active_provider) {
+            cfg.api_key = None;
+        }
         CommandResult::Message("Logged out. Credentials cleared.".to_string())
     }
 }
@@ -3574,7 +3593,7 @@ impl SlashCommand for PermissionsCommand {
                 };
                 let mut new_config = ctx.config.clone();
                 new_config.permission_mode = mode.clone();
-                if let Err(e) = save_settings_mutation(|s| s.config.permission_mode = mode.clone()) {
+                if let Err(e) = save_settings_mutation(|s| s.permission_mode = mode.clone()) {
                     return CommandResult::Error(format!("Failed to save: {}", e));
                 }
                 CommandResult::ConfigChangeMessage(
@@ -3593,10 +3612,10 @@ impl SlashCommand for PermissionsCommand {
                 }
                 new_config.disallowed_tools.retain(|t| t != &tool);
                 if let Err(e) = save_settings_mutation(|s| {
-                    if !s.config.allowed_tools.contains(&tool) {
-                        s.config.allowed_tools.push(tool.clone());
+                    if !s.allowed_tools.contains(&tool) {
+                        s.allowed_tools.push(tool.clone());
                     }
-                    s.config.disallowed_tools.retain(|t| t != &tool);
+                    s.disallowed_tools.retain(|t| t != &tool);
                 }) {
                     return CommandResult::Error(format!("Failed to save: {}", e));
                 }
@@ -3613,10 +3632,10 @@ impl SlashCommand for PermissionsCommand {
                 }
                 new_config.allowed_tools.retain(|t| t != &tool);
                 if let Err(e) = save_settings_mutation(|s| {
-                    if !s.config.disallowed_tools.contains(&tool) {
-                        s.config.disallowed_tools.push(tool.clone());
+                    if !s.disallowed_tools.contains(&tool) {
+                        s.disallowed_tools.push(tool.clone());
                     }
-                    s.config.allowed_tools.retain(|t| t != &tool);
+                    s.allowed_tools.retain(|t| t != &tool);
                 }) {
                     return CommandResult::Error(format!("Failed to save: {}", e));
                 }
@@ -3628,9 +3647,9 @@ impl SlashCommand for PermissionsCommand {
                 new_config.disallowed_tools.clear();
                 new_config.permission_mode = claurst_core::config::PermissionMode::Default;
                 if let Err(e) = save_settings_mutation(|s| {
-                    s.config.allowed_tools.clear();
-                    s.config.disallowed_tools.clear();
-                    s.config.permission_mode = claurst_core::config::PermissionMode::Default;
+                    s.allowed_tools.clear();
+                    s.disallowed_tools.clear();
+                    s.permission_mode = claurst_core::config::PermissionMode::Default;
                 }) {
                     return CommandResult::Error(format!("Failed to save: {}", e));
                 }
@@ -5425,7 +5444,7 @@ impl SlashCommand for RemoteEnvCommand {
                 let key_owned = key.to_string();
                 let val_owned = val.to_string();
                 if let Err(e) = save_settings_mutation(|s| {
-                    s.config.env.insert(key_owned.clone(), val_owned.clone());
+                    s.env.insert(key_owned.clone(), val_owned.clone());
                 }) {
                     return CommandResult::Error(format!("Failed to save: {}", e));
                 }
@@ -5447,7 +5466,7 @@ impl SlashCommand for RemoteEnvCommand {
                 }
                 let key_owned = key.to_string();
                 if let Err(e) = save_settings_mutation(|s| {
-                    s.config.env.remove(&key_owned);
+                    s.env.remove(&key_owned);
                 }) {
                     return CommandResult::Error(format!("Failed to save: {}", e));
                 }
@@ -8767,7 +8786,6 @@ impl SlashCommand for ManagedAgentsCommand {
                     let name = p.name.to_string();
                     if let Err(e) = save_settings_mutation(|settings| {
                         settings.managed_agents = Some(new_cfg.clone());
-                        settings.config.managed_agents = Some(new_cfg.clone());
                     }) {
                         return CommandResult::Error(format!("Failed to save: {}", e));
                     }
@@ -8846,7 +8864,6 @@ impl SlashCommand for ManagedAgentsCommand {
 
             if let Err(e) = save_settings_mutation(|settings| {
                 settings.managed_agents = Some(cfg.clone());
-                settings.config.managed_agents = Some(cfg.clone());
             }) {
                 return CommandResult::Error(format!("Failed to save: {}", e));
             }
@@ -8866,7 +8883,6 @@ impl SlashCommand for ManagedAgentsCommand {
                     cfg.total_budget_usd = if amount <= 0.0 { None } else { Some(amount) };
                     if let Err(e) = save_settings_mutation(|settings| {
                         settings.managed_agents = Some(cfg.clone());
-                        settings.config.managed_agents = Some(cfg.clone());
                     }) {
                         return CommandResult::Error(format!("Failed to save: {}", e));
                     }
@@ -8893,7 +8909,6 @@ impl SlashCommand for ManagedAgentsCommand {
             cfg.enabled = true;
             if let Err(e) = save_settings_mutation(|settings| {
                 settings.managed_agents = Some(cfg.clone());
-                settings.config.managed_agents = Some(cfg.clone());
             }) {
                 return CommandResult::Error(format!("Failed to save: {}", e));
             }
@@ -8910,7 +8925,6 @@ impl SlashCommand for ManagedAgentsCommand {
             cfg.enabled = false;
             if let Err(e) = save_settings_mutation(|settings| {
                 settings.managed_agents = Some(cfg.clone());
-                settings.config.managed_agents = Some(cfg.clone());
             }) {
                 return CommandResult::Error(format!("Failed to save: {}", e));
             }
@@ -8922,7 +8936,6 @@ impl SlashCommand for ManagedAgentsCommand {
         if args == "reset" {
             if let Err(e) = save_settings_mutation(|settings| {
                 settings.managed_agents = None;
-                settings.config.managed_agents = None;
             }) {
                 return CommandResult::Error(format!("Failed to save: {}", e));
             }
@@ -9187,7 +9200,7 @@ impl SlashCommand for TemplateCommand {
 /// Build slash commands from user-defined command templates stored in
 /// `settings.commands`.
 pub fn commands_from_settings(settings: &claurst_core::Settings) -> Vec<Box<dyn SlashCommand>> {
-    settings.commands.iter().map(|(name, template)| {
+    settings.commands.iter().map(|(name, template): (&String, &claurst_core::config::CommandTemplate)| {
         Box::new(TemplateCommand {
             name: name.clone(),
             template: template.clone(),
@@ -9422,8 +9435,13 @@ mod tests {
     use claurst_core::cost::CostTracker;
 
     fn make_ctx() -> CommandContext {
+        let config = claurst_core::config::Config::default();
+        let resolver = claurst_core::config::ConfigResolver::from_global(
+            claurst_core::config::GlobalScope { config: config.clone() },
+        );
         CommandContext {
-            config: claurst_core::config::Config::default(),
+            config,
+            resolver,
             cost_tracker: CostTracker::new(),
             messages: vec![],
             working_dir: std::path::PathBuf::from("."),

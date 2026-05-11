@@ -1,89 +1,9 @@
-// feature_gates.rs — Env-var-based feature gates and dynamic config.
+// feature_gates.rs — Minimal env-var helpers.
 //
-// Replaces the GrowthBook SDK used in the TypeScript source
-// (`src/services/analytics/growthbook.ts`). Feature flags are toggled via
-// environment variables instead of a remote service, which is simpler and
-// dependency-free for the Rust port.
+// No remote service, no settings.json integration, no in-process overrides.
+// Just simple env-var truthiness and parsing utilities.
 
 use std::collections::HashMap;
-
-use serde::de::DeserializeOwned;
-
-// ---------------------------------------------------------------------------
-// Name normalization
-// ---------------------------------------------------------------------------
-
-/// Normalize a gate/config name to the env-var suffix form:
-/// uppercase, replace `-` and `.` with `_`, strip other non-alphanumeric
-/// characters (except `_`).
-///
-/// Examples:
-///   "my-feature"       → "MY_FEATURE"
-///   "tengu.tide.elm"   → "TENGU_TIDE_ELM"
-///   "some:special!name" → "SOMESPECIALNAME"
-fn normalize_name(name: &str) -> String {
-    name.chars()
-        .map(|c| match c {
-            '-' | '.' => '_',
-            c if c.is_alphanumeric() || c == '_' => c.to_ascii_uppercase(),
-            _ => '\0', // sentinel — filtered out below
-        })
-        .filter(|&c| c != '\0')
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Feature gates
-// ---------------------------------------------------------------------------
-
-/// Check whether a named feature gate is enabled.
-///
-/// Reads `CLAURST_FEATURE_<NORMALIZED_NAME>` and returns `true` when the
-/// value is truthy ("1", "true", "yes", "on" — case-insensitive).
-///
-/// Mirrors `checkStatsigFeatureGate_CACHED_MAY_BE_STALE` from the TypeScript
-/// GrowthBook integration.
-pub fn is_feature_enabled(gate_name: &str) -> bool {
-    let key = format!("CLAURST_FEATURE_{}", normalize_name(gate_name));
-    is_env_truthy(std::env::var(&key).ok().as_deref())
-}
-
-// ---------------------------------------------------------------------------
-// Dynamic config
-// ---------------------------------------------------------------------------
-
-/// Read a JSON-encoded dynamic config from an environment variable.
-///
-/// Reads `CLAURST_DYNAMIC_CONFIG_<NORMALIZED_NAME>`.  If the variable is
-/// not set, or parsing fails, `default` is returned unchanged.
-///
-/// Mirrors `getDynamicConfig_CACHED_MAY_BE_STALE` from the TypeScript source.
-pub fn get_dynamic_config<T: DeserializeOwned>(name: &str, default: T) -> T {
-    let key = format!("CLAURST_DYNAMIC_CONFIG_{}", normalize_name(name));
-    match std::env::var(&key) {
-        Ok(val) => serde_json::from_str(&val).unwrap_or(default),
-        Err(_) => default,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Bare / simple mode
-// ---------------------------------------------------------------------------
-
-/// Return `true` when Claurst should run in "bare" (minimal) mode.
-///
-/// Bare mode skips LSP, plugin, and MCP startup for a faster, lighter
-/// experience.  It is enabled by either:
-///   - The `CLAURST_SIMPLE=1` environment variable, OR
-///   - The `--bare` flag in `std::env::args()`.
-pub fn is_bare_mode() -> bool {
-    // Check env var
-    if is_env_truthy(std::env::var("CLAURST_SIMPLE").ok().as_deref()) {
-        return true;
-    }
-    // Check CLI args without going through clap (avoids a full parse at this stage)
-    std::env::args().any(|a| a == "--bare")
-}
 
 // ---------------------------------------------------------------------------
 // Env-var truthiness helpers
@@ -111,6 +31,23 @@ pub fn is_env_defined_falsy(val: Option<&str>) -> bool {
         }
         None => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bare / simple mode
+// ---------------------------------------------------------------------------
+
+/// Return `true` when Claurst should run in "bare" (minimal) mode.
+///
+/// Bare mode skips LSP, plugin, and MCP startup for a faster, lighter
+/// experience.  It is enabled by either:
+///   - The `CLAURST_SIMPLE=1` environment variable, OR
+///   - The `--bare` flag in `std::env::args()`.
+pub fn is_bare_mode() -> bool {
+    if is_env_truthy(std::env::var("CLAURST_SIMPLE").ok().as_deref()) {
+        return true;
+    }
+    std::env::args().any(|a| a == "--bare")
 }
 
 // ---------------------------------------------------------------------------
@@ -157,27 +94,6 @@ pub fn get_aws_region() -> String {
 mod tests {
     use super::*;
 
-    // --- normalize_name ---
-
-    #[test]
-    fn normalize_replaces_dashes_and_dots() {
-        assert_eq!(normalize_name("my-feature"), "MY_FEATURE");
-        assert_eq!(normalize_name("tengu.tide.elm"), "TENGU_TIDE_ELM");
-        assert_eq!(normalize_name("a-b.c"), "A_B_C");
-    }
-
-    #[test]
-    fn normalize_strips_special_chars() {
-        assert_eq!(normalize_name("some:special!name"), "SOMESPECIALNAME");
-    }
-
-    #[test]
-    fn normalize_preserves_underscores() {
-        assert_eq!(normalize_name("already_upper"), "ALREADY_UPPER");
-    }
-
-    // --- is_env_truthy ---
-
     #[test]
     fn truthy_values() {
         for v in &["1", "true", "True", "TRUE", "yes", "YES", "on", "ON"] {
@@ -192,8 +108,6 @@ mod tests {
         }
         assert!(!is_env_truthy(None));
     }
-
-    // --- is_env_defined_falsy ---
 
     #[test]
     fn defined_falsy_values() {
@@ -218,14 +132,11 @@ mod tests {
         assert!(!is_env_defined_falsy(None));
     }
 
-    // --- parse_env_vars ---
-
     #[test]
     fn parse_env_vars_basic() {
         let args = vec!["KEY=VALUE".to_string(), "FOO=bar=baz".to_string()];
         let map = parse_env_vars(&args).unwrap();
         assert_eq!(map["KEY"], "VALUE");
-        // value may contain `=`
         assert_eq!(map["FOO"], "bar=baz");
     }
 
@@ -235,23 +146,9 @@ mod tests {
         assert!(parse_env_vars(&args).is_err());
     }
 
-    // --- get_aws_region ---
-
     #[test]
     fn aws_region_fallback() {
-        // Ensure the fallback works when neither env var is set.
-        // We can't easily unset env vars in tests, so we just verify the
-        // function returns a non-empty string.
         let region = get_aws_region();
         assert!(!region.is_empty());
-    }
-
-    // --- get_dynamic_config ---
-
-    #[test]
-    fn dynamic_config_returns_default_when_unset() {
-        // Use an unlikely key so we don't collide with a real env var.
-        let val: u32 = get_dynamic_config("__test_unset_key_xyzzy__", 42u32);
-        assert_eq!(val, 42);
     }
 }

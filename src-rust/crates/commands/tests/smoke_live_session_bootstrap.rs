@@ -21,8 +21,13 @@ fn make_live(settings: Settings, registry: ProjectRegistry) -> Arc<LiveSession> 
 }
 
 fn empty_ctx_with_live(live: Option<Arc<LiveSession>>) -> CommandContext {
+    let config = Config::default();
+    let resolver = claurst_core::config::ConfigResolver::from_global(
+        claurst_core::config::GlobalScope { config: config.clone() },
+    );
     CommandContext {
-        config: Config::default(),
+        config,
+        resolver,
         cost_tracker: CostTracker::new(),
         messages: vec![],
         working_dir: PathBuf::from("."),

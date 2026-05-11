@@ -237,6 +237,8 @@ pub struct ToolContext {
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
     /// Configured event hooks (PreToolUse, PostToolUse, etc.).
     pub config: claurst_core::config::Config,
+    /// Layered config resolver (once → session → project → global).
+    pub resolver: claurst_core::config::ConfigResolver,
     /// Managed agent (manager-executor) configuration, if active.
     pub managed_agent_config: Option<claurst_core::ManagedAgentConfig>,
     /// Optional notifier for injecting completion messages into the next agent turn.
@@ -588,6 +590,9 @@ mod tests {
             non_interactive: true,
             mcp_manager: None,
             config: Config::default(),
+            resolver: claurst_core::config::ConfigResolver::from_global(
+                claurst_core::config::GlobalScope { config: Config::default() },
+            ),
             managed_agent_config: None,
             completion_notifier: None,
             task_tracker: None,
@@ -620,6 +625,9 @@ mod tests {
             non_interactive: true,
             mcp_manager: None,
             config: Config::default(),
+            resolver: claurst_core::config::ConfigResolver::from_global(
+                claurst_core::config::GlobalScope { config: Config::default() },
+            ),
             managed_agent_config: None,
             completion_notifier: None,
             task_tracker: None,

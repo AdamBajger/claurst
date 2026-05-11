@@ -24,7 +24,7 @@ use crate::settings_screen::SettingsScreen;
 use crate::stats_dialog::StatsDialogState;
 use crate::theme_screen::ThemeScreen;
 use crate::{agents_view::{AgentInfo, AgentStatus, AgentsMenuState, AgentsRoute}, diff_viewer::DiffPane};
-use claurst_core::config::{Config, Settings, Theme};
+use claurst_core::config::{Config, ConfigResolver, Settings, Theme};
 use claurst_core::cost::CostTracker;
 use claurst_core::file_history::FileHistory;
 use claurst_core::keybindings::{
@@ -608,6 +608,9 @@ pub enum FocusTarget {
 pub struct App {
     // Core state
     pub config: Config,
+    /// Layered config resolver (once → session → project → global).
+    /// Use for reads; `config` is kept for backward compatibility during migration.
+    pub resolver: ConfigResolver,
     pub cost_tracker: Arc<CostTracker>,
     pub messages: Vec<Message>,
     /// Combined display list kept in sync with `messages`: real conversation turns
@@ -894,6 +897,9 @@ pub struct App {
     // ---- Thinking block expansion state ----------------------------------
     /// Set of thinking block content hashes that are expanded.
     pub thinking_expanded: std::collections::HashSet<u64>,
+    // ---- Tool result expansion state -------------------------------------
+    /// Set of tool_use_id strings whose results are expanded (override visibility).
+    pub expanded_tool_results: std::collections::HashSet<String>,
     /// The message pane area from the last render frame (used for mouse hit testing).
     pub last_msg_area: Cell<ratatui::layout::Rect>,
     /// The frame region that supports text selection.
@@ -1110,12 +1116,12 @@ fn format_turn_time_label() -> String {
 }
 
 impl App {
-    pub fn new(config: Config, cost_tracker: Arc<CostTracker>) -> Self {
-        let config = config;
+    pub fn new(config: Config, resolver: ConfigResolver, cost_tracker: Arc<CostTracker>) -> Self {
         let model_name = config.effective_model().to_string();
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
         Self {
             config,
+            resolver,
             cost_tracker,
             messages: Vec::new(),
             display_messages: Vec::new(),
@@ -1298,6 +1304,7 @@ impl App {
             worktree_branch: None,
             agent_type_badge: None,
             thinking_expanded: std::collections::HashSet::new(),
+            expanded_tool_results: std::collections::HashSet::new(),
             last_msg_area: Cell::new(ratatui::layout::Rect::default()),
             last_selectable_area: Cell::new(ratatui::layout::Rect::default()),
             last_input_area: Cell::new(ratatui::layout::Rect::default()),
@@ -1507,7 +1514,7 @@ impl App {
 
     fn persist_custom_provider_base_url(&self, base_url: &str) {
         let mut settings = Settings::load_sync().unwrap_or_default();
-        let entry = settings.providers.entry("custom-openai".to_string()).or_default();
+        let entry = settings.provider_configs.entry("custom-openai".to_string()).or_default();
         entry.api_base = Some(base_url.to_string());
         entry.enabled = true;
         let _ = settings.save_sync();
@@ -1516,8 +1523,7 @@ impl App {
     fn persist_provider_and_model(&self) {
         let mut settings = Settings::load_sync().unwrap_or_default();
         settings.provider = self.config.provider.clone();
-        settings.config.provider = self.config.provider.clone();
-        settings.config.model = self.config.model.clone();
+        settings.model = self.config.model.clone();
         let _ = settings.save_sync();
     }
 
@@ -1730,7 +1736,7 @@ impl App {
         self.config.theme = theme;
         // Persist to settings file
         let mut settings = Settings::load_sync().unwrap_or_default();
-        settings.config.theme = self.config.theme.clone();
+        settings.theme = self.config.theme.clone();
         let _ = settings.save_sync();
         self.status_message = Some(format!("Theme set to: {}", theme_name));
     }
@@ -2795,7 +2801,7 @@ impl App {
                             "custom-openai" => {
                                 let current_url = Settings::load_sync()
                                     .ok()
-                                    .and_then(|settings| settings.providers.get("custom-openai").and_then(|p| p.api_base.clone()));
+                                    .and_then(|settings| settings.provider_configs.get("custom-openai").and_then(|p| p.api_base.clone()));
                                 self.custom_provider_dialog
                                     .open(selected.id.clone(), selected.title.clone(), current_url);
                             }
@@ -5420,8 +5426,11 @@ mod tests {
 
     fn make_app() -> App {
         let config = Config::default();
+        let resolver = claurst_core::config::ConfigResolver::from_global(
+            claurst_core::config::GlobalScope { config: config.clone() },
+        );
         let cost_tracker = claurst_core::cost::CostTracker::new();
-        App::new(config, cost_tracker)
+        App::new(config, resolver, cost_tracker)
     }
 
     fn press_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {

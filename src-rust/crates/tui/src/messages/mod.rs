@@ -39,6 +39,10 @@ pub struct RenderContext {
     pub tool_names: HashMap<String, String>,
     /// Set of thinking block content hashes that are expanded per-block.
     pub expanded_thinking: std::collections::HashSet<u64>,
+    /// Global tool visibility setting (Minimal / Compact / Full).
+    pub tool_visibility: claurst_core::config::ToolVisibility,
+    /// Set of tool_use_id strings whose results are expanded (override visibility).
+    pub expanded_tool_results: std::collections::HashSet<String>,
 }
 
 impl Default for RenderContext {
@@ -49,6 +53,8 @@ impl Default for RenderContext {
             show_thinking: false,
             tool_names: HashMap::new(),
             expanded_thinking: std::collections::HashSet::new(),
+            tool_visibility: claurst_core::config::ToolVisibility::default(),
+            expanded_tool_results: std::collections::HashSet::new(),
         }
     }
 }
@@ -447,16 +453,19 @@ pub fn render_transcript_assistant_message(
         buffer.clear();
     };
 
-    for block in msg.content_blocks() {
+    // ------------------------------------------------------------------
+    // Two-pass rendering so that agent text appears LAST in the TUI.
+    // Pass 1: collect all non-text blocks.
+    // Pass 2: append all text blocks at the bottom.
+    // ------------------------------------------------------------------
+
+    let blocks: Vec<ContentBlock> = msg.content_blocks();
+
+    // --- Pass 1: non-text blocks ---
+    for block in &blocks {
         match block {
-            ContentBlock::Text { text } => {
-                if !pending_text.is_empty() {
-                    pending_text.push('\n');
-                }
-                pending_text.push_str(&text);
-            }
+            ContentBlock::Text { .. } => {}
             ContentBlock::Thinking { thinking, .. } => {
-                flush_text(&mut pending_text, &mut lines);
                 let thinking_hash = {
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};
@@ -468,7 +477,6 @@ pub fn render_transcript_assistant_message(
                 lines.extend(render_transcript_reasoning_block(&thinking, expanded, ctx.width));
             }
             ContentBlock::RedactedThinking { .. } => {
-                flush_text(&mut pending_text, &mut lines);
                 lines.push(Line::from(vec![Span::styled(
                     "  Thinking hidden".to_string(),
                     Style::default()
@@ -477,27 +485,75 @@ pub fn render_transcript_assistant_message(
                 )]));
             }
             ContentBlock::ToolUse { name, input, .. } => {
-                flush_text(&mut pending_text, &mut lines);
+                let use_lines = match ctx.tool_visibility {
+                    claurst_core::config::ToolVisibility::Minimal => {
+                        // One-line tool name only
+                        let summary = extract_tool_summary(name, input);
+                        vec![Line::from(vec![
+                            Span::styled("  ~ ".to_string(), Style::default().fg(CLAUDE_ORANGE)),
+                            Span::styled(
+                                format!("{} {}", name, summary),
+                                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                            ),
+                        ])]
+                    }
+                    _ => render_tool_use_inner(name, input),
+                };
                 lines.extend(indent_lines(
-                    render_tool_use_inner(&name, &input),
+                    use_lines,
                     "   ",
                     Style::default(),
                     TRANSCRIPT_TEXT,
                 ));
             }
             ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                flush_text(&mut pending_text, &mut lines);
-                let text = tool_result_text(&content);
-                let tool_name = ctx.tool_names.get(&tool_use_id).map(|name| name.as_str());
+                let expanded = ctx.expanded_tool_results.contains(tool_use_id);
+                let text = tool_result_text(content);
+                let tool_name = ctx.tool_names.get(tool_use_id).map(|name| name.as_str());
                 let rendered = if is_error.unwrap_or(false) {
-                    render_tool_result_error(&text)
+                    if expanded || matches!(ctx.tool_visibility, claurst_core::config::ToolVisibility::Full) {
+                        render_tool_result_error(&text)
+                    } else {
+                        let first_line = text.lines().next().unwrap_or("Error");
+                        vec![Line::from(vec![
+                            Span::styled("  Error: ".to_string(), Style::default().fg(Color::Rgb(255, 140, 0)).add_modifier(Modifier::BOLD)),
+                            Span::styled(first_line.to_string(), Style::default().fg(Color::Rgb(255, 140, 0))),
+                            Span::styled(" [expand]".to_string(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)),
+                        ])]
+                    }
                 } else {
-                    match tool_name {
-                        Some("Bash") | Some("PowerShell") => render_bash_output_block(&text, TOOL_RESULT_MAX_LINES),
-                        Some("Read") => render_file_read_result(&text),
-                        Some("Edit") => render_file_op_result(false),
-                        Some("Write") => render_file_op_result(true),
-                        _ => render_tool_result_success(&text, false),
+                    match ctx.tool_visibility {
+                        claurst_core::config::ToolVisibility::Minimal if !expanded => {
+                            vec![Line::from(vec![Span::styled(
+                                "  Done [expand]".to_string(),
+                                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                            )])]
+                        }
+                        claurst_core::config::ToolVisibility::Compact if !expanded => {
+                            let all_lines: Vec<&str> = text.lines().collect();
+                            let preview_lines = all_lines.len().min(3);
+                            let mut preview = all_lines[..preview_lines].join("\n");
+                            let remaining = all_lines.len().saturating_sub(preview_lines);
+                            if remaining > 0 {
+                                preview.push_str(&format!("\n... {} more lines [expand]", remaining));
+                            }
+                            match tool_name {
+                                Some("Bash") | Some("PowerShell") => render_bash_output_block(&preview, 3),
+                                Some("Read") => render_file_read_result(&preview),
+                                Some("Edit") => render_file_op_result(false),
+                                Some("Write") => render_file_op_result(true),
+                                _ => render_tool_result_success(&preview, false),
+                            }
+                        }
+                        _ => {
+                            match tool_name {
+                                Some("Bash") | Some("PowerShell") => render_bash_output_block(&text, TOOL_RESULT_MAX_LINES),
+                                Some("Read") => render_file_read_result(&text),
+                                Some("Edit") => render_file_op_result(false),
+                                Some("Write") => render_file_op_result(true),
+                                _ => render_tool_result_success(&text, false),
+                            }
+                        }
                     }
                 };
                 lines.extend(indent_lines(
@@ -508,11 +564,11 @@ pub fn render_transcript_assistant_message(
                 ));
             }
             ContentBlock::Image { source } => {
-                flush_text(&mut pending_text, &mut lines);
                 let label = render_image(&source).unwrap_or_else(|| {
                     source
                         .media_type
-                        .or(source.url)
+                        .clone()
+                        .or(source.url.clone())
                         .unwrap_or_else(|| "assistant image".to_string())
                 });
                 lines.extend(indent_lines(
@@ -523,11 +579,11 @@ pub fn render_transcript_assistant_message(
                 ));
             }
             ContentBlock::Document { title, context, source, .. } => {
-                flush_text(&mut pending_text, &mut lines);
                 let label = title
-                    .or(context)
-                    .or(source.url)
-                    .or(source.media_type)
+                    .clone()
+                    .or(context.clone())
+                    .or(source.url.clone())
+                    .or(source.media_type.clone())
                     .unwrap_or_else(|| "attached document".to_string());
                 lines.extend(indent_lines(
                     vec![render_attachment_chip("doc", label)],
@@ -537,55 +593,49 @@ pub fn render_transcript_assistant_message(
                 ));
             }
             ContentBlock::UserLocalCommandOutput { command, output } => {
-                flush_text(&mut pending_text, &mut lines);
                 lines.extend(indent_lines(
-                    render_user_local_command_output(&command, &output, 30),
+                    render_user_local_command_output(command, output, 30),
                     "   ",
                     Style::default(),
                     TRANSCRIPT_TEXT,
                 ));
             }
             ContentBlock::UserCommand { name, args } => {
-                flush_text(&mut pending_text, &mut lines);
                 lines.extend(indent_lines(
-                    render_user_command(&name, &args),
+                    render_user_command(name, args),
                     "   ",
                     Style::default(),
                     TRANSCRIPT_TEXT,
                 ));
             }
             ContentBlock::UserMemoryInput { key, value } => {
-                flush_text(&mut pending_text, &mut lines);
                 lines.extend(indent_lines(
-                    render_user_memory_input(&key, &value),
+                    render_user_memory_input(key, value),
                     "   ",
                     Style::default(),
                     TRANSCRIPT_TEXT,
                 ));
             }
             ContentBlock::SystemAPIError { message, retry_secs } => {
-                flush_text(&mut pending_text, &mut lines);
                 lines.extend(indent_lines(
-                    render_system_api_error(&message, retry_secs),
+                    render_system_api_error(message, *retry_secs),
                     "   ",
                     Style::default(),
                     TRANSCRIPT_TEXT,
                 ));
             }
             ContentBlock::CollapsedReadSearch { tool_name, paths, n_hidden } => {
-                flush_text(&mut pending_text, &mut lines);
                 let path_refs: Vec<&str> = paths.iter().map(|path| path.as_str()).collect();
                 lines.extend(indent_lines(
-                    render_collapsed_read_search(&tool_name, &path_refs, n_hidden),
+                    render_collapsed_read_search(tool_name, &path_refs, *n_hidden),
                     "   ",
                     Style::default(),
                     TRANSCRIPT_TEXT,
                 ));
             }
             ContentBlock::TaskAssignment { id, subject, description } => {
-                flush_text(&mut pending_text, &mut lines);
                 lines.extend(indent_lines(
-                    render_task_assignment(&id, &subject, &description),
+                    render_task_assignment(id, subject, description),
                     "   ",
                     Style::default(),
                     TRANSCRIPT_TEXT,
@@ -594,6 +644,15 @@ pub fn render_transcript_assistant_message(
         }
     }
 
+    // --- Pass 2: text blocks rendered LAST ---
+    for block in &blocks {
+        if let ContentBlock::Text { text } = block {
+            if !pending_text.is_empty() {
+                pending_text.push('\n');
+            }
+            pending_text.push_str(text);
+        }
+    }
     flush_text(&mut pending_text, &mut lines);
     lines
 }
@@ -1233,17 +1292,13 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
     let mut lines = Vec::new();
     let mut pending_text = String::new();
 
-    for block in msg.content_blocks() {
+    let blocks: Vec<ContentBlock> = msg.content_blocks();
+
+    // --- Pass 1: non-text blocks ---
+    for block in &blocks {
         match block {
-            ContentBlock::Text { text } => {
-                if !pending_text.is_empty() {
-                    pending_text.push('\n');
-                }
-                pending_text.push_str(&text);
-            }
+            ContentBlock::Text { .. } => {}
             ContentBlock::Thinking { thinking, .. } => {
-                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
-                // Compute a stable hash of the thinking content for per-block expansion tracking
                 let thinking_hash = {
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};
@@ -1253,13 +1308,12 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                 };
                 let expanded = ctx.show_thinking || ctx.expanded_thinking.contains(&thinking_hash);
                 lines.extend(prefix_message_lines(
-                    render_thinking_block(&thinking, expanded),
+                    render_thinking_block(thinking, expanded),
                     &msg.role,
                     ctx.width,
                 ));
             }
             ContentBlock::RedactedThinking { .. } => {
-                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 lines.extend(prefix_message_lines(
                     vec![Line::from(vec![Span::styled(
                         "Thinking redacted",
@@ -1272,40 +1326,76 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                 ));
             }
             ContentBlock::ToolUse { id, name, input } => {
-                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
-                let rendered = render_tool_use_inner(&name, &input);
-                // Silence unused-variable warning on id — kept for symmetry with ToolResult lookup.
-                let _ = &id;
-                lines.extend(prefix_message_lines(rendered, &msg.role, ctx.width));
+                let use_lines = match ctx.tool_visibility {
+                    claurst_core::config::ToolVisibility::Minimal => {
+                        let summary = extract_tool_summary(name, input);
+                        vec![Line::from(vec![
+                            Span::styled("~ ".to_string(), Style::default().fg(CLAUDE_ORANGE)),
+                            Span::styled(
+                                format!("{} {}", name, summary),
+                                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                            ),
+                        ])]
+                    }
+                    _ => render_tool_use_inner(name, input),
+                };
+                let _ = id;
+                lines.extend(prefix_message_lines(use_lines, &msg.role, ctx.width));
             }
             ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
-                let text = tool_result_text(&content);
-                let tool_name = ctx.tool_names.get(&tool_use_id).map(|s| s.as_str());
+                let expanded = ctx.expanded_tool_results.contains(tool_use_id);
+                let text = tool_result_text(content);
+                let tool_name = ctx.tool_names.get(tool_use_id).map(|s| s.as_str());
                 let rendered = if is_error.unwrap_or(false) {
-                    render_tool_result_error(&text)
+                    if expanded || matches!(ctx.tool_visibility, claurst_core::config::ToolVisibility::Full) {
+                        render_tool_result_error(&text)
+                    } else {
+                        let first_line = text.lines().next().unwrap_or("Error");
+                        vec![Line::from(vec![
+                            Span::styled("Error: ".to_string(), Style::default().fg(Color::Rgb(255, 140, 0)).add_modifier(Modifier::BOLD)),
+                            Span::styled(first_line.to_string(), Style::default().fg(Color::Rgb(255, 140, 0))),
+                            Span::styled(" [expand]".to_string(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)),
+                        ])]
+                    }
                 } else {
-                    match tool_name {
-                        Some("Bash") | Some("PowerShell") => {
-                            render_bash_output_block(&text, TOOL_RESULT_MAX_LINES)
+                    match ctx.tool_visibility {
+                        claurst_core::config::ToolVisibility::Minimal if !expanded => {
+                            vec![Line::from(vec![Span::styled(
+                                "Done [expand]".to_string(),
+                                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                            )])]
                         }
-                        Some("Read") => render_file_read_result(&text),
-                        Some("Edit") => render_file_op_result(false),
-                        Some("Write") => render_file_op_result(true),
-                        _ => render_tool_result_success(&text, false),
+                        claurst_core::config::ToolVisibility::Compact if !expanded => {
+                            let all_lines: Vec<&str> = text.lines().collect();
+                            let preview_lines = all_lines.len().min(3);
+                            let mut preview = all_lines[..preview_lines].join("\n");
+                            let remaining = all_lines.len().saturating_sub(preview_lines);
+                            if remaining > 0 {
+                                preview.push_str(&format!("\n... {} more lines [expand]", remaining));
+                            }
+                            match tool_name {
+                                Some("Bash") | Some("PowerShell") => render_bash_output_block(&preview, 3),
+                                Some("Read") => render_file_read_result(&preview),
+                                Some("Edit") => render_file_op_result(false),
+                                Some("Write") => render_file_op_result(true),
+                                _ => render_tool_result_success(&preview, false),
+                            }
+                        }
+                        _ => {
+                            match tool_name {
+                                Some("Bash") | Some("PowerShell") => render_bash_output_block(&text, TOOL_RESULT_MAX_LINES),
+                                Some("Read") => render_file_read_result(&text),
+                                Some("Edit") => render_file_op_result(false),
+                                Some("Write") => render_file_op_result(true),
+                                _ => render_tool_result_success(&text, false),
+                            }
+                        }
                     }
                 };
                 lines.extend(prefix_message_lines(rendered, &msg.role, ctx.width));
             }
             ContentBlock::Image { source } => {
-                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
-                // Attempt Kitty graphics protocol rendering.  When the
-                // terminal supports it and the source carries inline base64
-                // data, `render_image` emits the APC escape sequence directly
-                // to stdout and returns `None` — nothing more to do for this
-                // block.  Otherwise it returns a human-readable fallback
-                // string that we display as a normal styled line.
-                if let Some(label) = render_image(&source) {
+                if let Some(label) = render_image(source) {
                     lines.extend(prefix_message_lines(
                         render_attachment_line("Image", label),
                         &msg.role,
@@ -1314,11 +1404,11 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                 }
             }
             ContentBlock::Document { title, context, source, .. } => {
-                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 let label = title
-                    .or(context)
-                    .or(source.url)
-                    .or(source.media_type)
+                    .clone()
+                    .or(context.clone())
+                    .or(source.url.clone())
+                    .or(source.media_type.clone())
                     .unwrap_or_else(|| "attached document".to_string());
                 lines.extend(prefix_message_lines(
                     render_attachment_line("Document", label),
@@ -1327,33 +1417,36 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                 ));
             }
             ContentBlock::UserLocalCommandOutput { command, output } => {
-                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
-                lines.extend(render_user_local_command_output(&command, &output, 30));
+                lines.extend(render_user_local_command_output(command, output, 30));
             }
             ContentBlock::UserCommand { name, args } => {
-                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
-                lines.extend(render_user_command(&name, &args));
+                lines.extend(render_user_command(name, args));
             }
             ContentBlock::UserMemoryInput { key, value } => {
-                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
-                lines.extend(render_user_memory_input(&key, &value));
+                lines.extend(render_user_memory_input(key, value));
             }
             ContentBlock::SystemAPIError { message, retry_secs } => {
-                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
-                lines.extend(render_system_api_error(&message, retry_secs));
+                lines.extend(render_system_api_error(message, *retry_secs));
             }
             ContentBlock::CollapsedReadSearch { tool_name, paths, n_hidden } => {
-                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-                lines.extend(render_collapsed_read_search(&tool_name, &path_refs, n_hidden));
+                lines.extend(render_collapsed_read_search(tool_name, &path_refs, *n_hidden));
             }
             ContentBlock::TaskAssignment { id, subject, description } => {
-                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
-                lines.extend(render_task_assignment(&id, &subject, &description));
+                lines.extend(render_task_assignment(id, subject, description));
             }
         }
     }
 
+    // --- Pass 2: text blocks rendered LAST ---
+    for block in &blocks {
+        if let ContentBlock::Text { text } = block {
+            if !pending_text.is_empty() {
+                pending_text.push('\n');
+            }
+            pending_text.push_str(text);
+        }
+    }
     flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
     lines.push(Line::from(""));
     lines
@@ -1600,6 +1693,7 @@ mod tests {
             width: 80,
             highlight: true,
             show_thinking: false,
+            tool_visibility: claurst_core::config::ToolVisibility::Full,
             ..Default::default()
         };
 
@@ -1789,7 +1883,11 @@ mod tests {
             name: "Bash".to_string(),
             input: serde_json::json!({"command": "ls -la"}),
         }]);
-        let rendered = render_message(&msg, &RenderContext::default())
+        let ctx = RenderContext {
+            tool_visibility: claurst_core::config::ToolVisibility::Full,
+            ..Default::default()
+        };
+        let rendered = render_message(&msg, &ctx)
             .into_iter()
             .map(|l| line_text(&l))
             .collect::<Vec<_>>()
@@ -1806,7 +1904,11 @@ mod tests {
             name: "Read".to_string(),
             input: serde_json::json!({"file_path": "/tmp/foo.txt"}),
         }]);
-        let rendered = render_message(&msg, &RenderContext::default())
+        let ctx = RenderContext {
+            tool_visibility: claurst_core::config::ToolVisibility::Full,
+            ..Default::default()
+        };
+        let rendered = render_message(&msg, &ctx)
             .into_iter()
             .map(|l| line_text(&l))
             .collect::<Vec<_>>()
@@ -1826,7 +1928,11 @@ mod tests {
                 "description": "Trace the auth flow"
             }),
         }]);
-        let rendered = render_message(&msg, &RenderContext::default())
+        let ctx = RenderContext {
+            tool_visibility: claurst_core::config::ToolVisibility::Full,
+            ..Default::default()
+        };
+        let rendered = render_message(&msg, &ctx)
             .into_iter()
             .map(|l| line_text(&l))
             .collect::<Vec<_>>()
@@ -1839,7 +1945,11 @@ mod tests {
     fn bash_tool_result_renders_as_bash_output_with_tool_names_context() {
         let mut tool_names = HashMap::new();
         tool_names.insert("tu-bash-1".to_string(), "Bash".to_string());
-        let ctx = RenderContext { tool_names, ..Default::default() };
+        let ctx = RenderContext {
+            tool_names,
+            tool_visibility: claurst_core::config::ToolVisibility::Full,
+            ..Default::default()
+        };
 
         let msg = Message::user_blocks(vec![ContentBlock::ToolResult {
             tool_use_id: "tu-bash-1".to_string(),
@@ -1864,7 +1974,11 @@ mod tests {
             is_error: Some(false),
         }]);
         // No tool_names → falls back to render_tool_result_success (no separate header)
-        let rendered = render_message(&msg, &RenderContext::default())
+        let ctx = RenderContext {
+            tool_visibility: claurst_core::config::ToolVisibility::Full,
+            ..Default::default()
+        };
+        let rendered = render_message(&msg, &ctx)
             .into_iter()
             .map(|l| line_text(&l))
             .collect::<Vec<_>>()

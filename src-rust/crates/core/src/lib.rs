@@ -51,9 +51,6 @@ pub mod file_history;
 // Snapshot/undo system — tracks file changes per session for /undo support.
 pub mod snapshot;
 
-// Feature flag management via GrowthBook.
-pub mod feature_flags;
-
 // MCP resource prompt template rendering with variable substitution.
 pub mod mcp_templates;
 
@@ -75,14 +72,17 @@ pub use types::{
     ContentBlock, ImageSource, DocumentSource, CitationsConfig, Message, MessageContent,
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
-pub use config::{AgentConfig, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
+pub use config::{AgentConfig, AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, SessionConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
 
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
 pub use skill_discovery::{DiscoveredSkill, discover_skills, parse_skill_file};
 pub use cost::CostTracker;
 pub use history::ConversationSession;
-pub use feature_flags::FeatureFlagManager;
+pub use feature_gates::{
+    is_env_truthy, is_env_defined_falsy,
+    is_bare_mode, parse_env_vars, get_aws_region,
+};
 pub use snapshot::SnapshotManager;
 pub use permissions::{
     AutoPermissionHandler, CommandPattern, InputMatcher, InteractivePermissionHandler,
@@ -580,6 +580,57 @@ pub mod config {
     use std::path::PathBuf;
     use crate::system_prompt::OutputStyle;
 
+    // ---- Config trait ------------------------------------------------------
+
+    /// Base trait for all configuration objects.
+    /// Provides serialization, deserialization, validation, merging, and persistence.
+    pub trait ClaurstConfig: Serialize + for<'de> Deserialize<'de> + Default + Clone + Send + Sync {
+        /// Load from a JSON string with unknown-field warnings.
+        fn from_json(content: &str) -> anyhow::Result<Self> {
+            let raw: serde_json::Value = serde_json::from_str(content)
+                .map_err(|e| anyhow::anyhow!("invalid JSON: {}", e))?;
+            let mut warnings: Vec<String> = Vec::new();
+            let cfg: Self = serde_ignored::deserialize(&raw, |path| {
+                warnings.push(path.to_string());
+            }).map_err(|e| anyhow::anyhow!("invalid config structure: {}", e))?;
+            if !warnings.is_empty() {
+                eprintln!("⚠️  Warning: unknown fields (ignored): {}", warnings.join(", "));
+            }
+            Ok(cfg)
+        }
+
+        /// Serialize to a pretty JSON string.
+        fn to_json(&self) -> anyhow::Result<String> {
+            serde_json::to_string_pretty(self)
+                .map_err(|e| anyhow::anyhow!("serialization failed: {}", e))
+        }
+
+        /// Merge another config into this one (other wins on conflict).
+        fn merge(&mut self, other: Self);
+
+        /// Validate the config and return a list of errors.
+        fn validate(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        /// Persist this config to the given path.
+        fn save_to_path(&self, path: &std::path::Path) -> anyhow::Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let content = self.to_json()?;
+            std::fs::write(path, content)?;
+            Ok(())
+        }
+
+        /// Load this config from the given path.
+        fn load_from_path(path: &std::path::Path) -> anyhow::Result<Self> {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("{}: read failed: {}", path.display(), e))?;
+            Self::from_json(&content)
+        }
+    }
+
     // ---- Hook configuration ----------------------------------------------
 
     /// Events that can trigger hooks.
@@ -728,6 +779,9 @@ pub mod config {
     /// `temperature`, `access`, `visible`, `max_turns`, `color`) preserved for
     /// settings.json round-trip; `prompt` renamed to `append_system_prompt` with
     /// serde alias. New fields are additive with `#[serde(default)]`.
+    /// Back-compat alias for code that still references `AgentDefinition`.
+    pub type AgentDefinition = AgentConfig;
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct AgentConfig {
         // ---- legacy fields (serde-stable) ----
@@ -975,63 +1029,8 @@ pub mod config {
         }
     }
 
-    // ---- Config ----------------------------------------------------------
-
-    /// Top-level configuration values, merged from CLI args + settings file + env.
-    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-    pub struct Config {
-        pub api_key: Option<String>,
-        pub model: Option<String>,
-        pub max_tokens: Option<u32>,
-        pub permission_mode: PermissionMode,
-        pub theme: Theme,
-        #[serde(default)]
-        pub output_style: Option<String>,
-        pub auto_compact: bool,
-        pub compact_threshold: f32,
-        pub verbose: bool,
-        pub output_format: OutputFormat,
-        pub mcp_servers: Vec<McpServerConfig>,
-        #[serde(default)]
-        pub lsp_servers: Vec<crate::lsp::LspServerConfig>,
-        pub allowed_tools: Vec<String>,
-        pub disallowed_tools: Vec<String>,
-        pub env: HashMap<String, String>,
-        pub enable_all_mcp_servers: bool,
-        pub custom_system_prompt: Option<String>,
-        pub append_system_prompt: Option<String>,
-        pub disable_claude_mds: bool,
-        pub project_dir: Option<PathBuf>,
-        #[serde(default)]
-        pub workspace_paths: Vec<PathBuf>,
-        /// Additional directories granted access via --add-dir.
-        #[serde(default)]
-        pub additional_dirs: Vec<PathBuf>,
-        /// Event hooks: map of event → list of hook commands.
-        #[serde(default)]
-        pub hooks: HashMap<HookEvent, Vec<HookEntry>>,
-        /// Active provider ID (default: "anthropic")
-        #[serde(default)]
-        pub provider: Option<String>,
-        /// Per-provider configurations
-        #[serde(default)]
-        pub provider_configs: HashMap<String, ProviderConfig>,
-        /// Formatter configurations (copied from Settings on load).
-        #[serde(default)]
-        pub formatter: HashMap<String, FormatterConfig>,
-        /// User-defined command templates (copied from Settings on load).
-        #[serde(default)]
-        pub commands: HashMap<String, CommandTemplate>,
-        /// Named agent definitions (copied from Settings on load).
-        #[serde(default)]
-        pub agents: HashMap<String, AgentConfig>,
-        /// Skill-discovery configuration (copied from Settings on load).
-        #[serde(default)]
-        pub skills: SkillsConfig,
-        /// Managed agent (manager-executor) configuration.
-        #[serde(default)]
-        pub managed_agents: Option<ManagedAgentConfig>,
-    }
+    // Config struct eliminated — all fields now live directly in Settings.
+    // `pub type Config = Settings;` alias below keeps existing code compiling.
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
     #[serde(rename_all = "camelCase")]
@@ -1052,6 +1051,15 @@ pub mod config {
         Light,
         Custom(String),
         Deuteranopia,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub enum ToolVisibility {
+        #[default]
+        Minimal,
+        Compact,
+        Full,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1097,51 +1105,99 @@ pub mod config {
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct Settings {
-        #[serde(default)]
-        pub config: Config,
-        pub version: Option<u32>,
-        #[serde(default)]
-        pub projects: HashMap<String, ProjectSettings>,
-        #[serde(default, rename = "remoteControlAtStartup")]
-        pub remote_control_at_startup: bool,
-        /// Persisted permission rules saved by the user across sessions.
-        #[serde(default, rename = "permissionRules")]
-        pub permission_rules: Vec<crate::permissions::SerializedPermissionRule>,
-        /// Names of plugins that have been explicitly enabled by the user.
-        #[serde(default, rename = "enabledPlugins")]
-        pub enabled_plugins: std::collections::HashSet<String>,
-        /// Names of plugins that have been explicitly disabled by the user.
-        #[serde(default, rename = "disabledPlugins")]
-        pub disabled_plugins: std::collections::HashSet<String>,
-        /// Whether the user has completed the first-launch onboarding flow.
-        /// Mirrors TS `hasAcknowledgedSafetyNotice` / `hasCompletedOnboarding`.
-        #[serde(default, rename = "hasCompletedOnboarding")]
-        pub has_completed_onboarding: bool,
-        /// App version at last launch — used to detect upgrades and show release notes.
-        #[serde(default, rename = "lastSeenVersion")]
-        pub last_seen_version: Option<String>,
-        /// Active provider ID at the settings level (e.g. "anthropic", "openai").
+        // ── Active selections ──
         #[serde(default)]
         pub provider: Option<String>,
-        /// Per-provider configurations stored in settings.json.
         #[serde(default)]
-        pub providers: HashMap<String, ProviderConfig>,
-        /// User-defined slash command templates.
+        pub model: Option<String>,
         #[serde(default)]
-        pub commands: HashMap<String, CommandTemplate>,
-        /// Formatter configurations keyed by a user-defined name.
+        pub agent: Option<String>,
+        #[serde(default)]
+        pub project: Option<String>,
+        #[serde(default)]
+        pub session: Option<String>,
+
+        // ── Global scalar settings (all former Config fields) ──
+        #[serde(default)]
+        pub max_tokens: Option<u32>,
+        #[serde(default)]
+        pub permission_mode: PermissionMode,
+        #[serde(default)]
+        pub theme: Theme,
+        #[serde(default)]
+        pub output_style: Option<String>,
+        #[serde(default)]
+        pub auto_compact: bool,
+        #[serde(default)]
+        pub compact_threshold: f32,
+        #[serde(default)]
+        pub verbose: bool,
+        #[serde(default)]
+        pub output_format: OutputFormat,
+        #[serde(default)]
+        pub mcp_servers: Vec<McpServerConfig>,
+        #[serde(default)]
+        pub lsp_servers: Vec<crate::lsp::LspServerConfig>,
+        #[serde(default)]
+        pub allowed_tools: Vec<String>,
+        #[serde(default)]
+        pub disallowed_tools: Vec<String>,
+        #[serde(default)]
+        pub env: HashMap<String, String>,
+        #[serde(default)]
+        pub enable_all_mcp_servers: bool,
+        #[serde(default)]
+        pub custom_system_prompt: Option<String>,
+        #[serde(default)]
+        pub append_system_prompt: Option<String>,
+        #[serde(default)]
+        pub disable_claude_mds: bool,
+        #[serde(default)]
+        pub project_dir: Option<PathBuf>,
+        #[serde(default)]
+        pub workspace_paths: Vec<PathBuf>,
+        #[serde(default)]
+        pub additional_dirs: Vec<PathBuf>,
+        #[serde(default)]
+        pub hooks: HashMap<HookEvent, Vec<HookEntry>>,
+        #[serde(default)]
+        pub provider_configs: HashMap<String, ProviderConfig>,
         #[serde(default)]
         pub formatter: HashMap<String, FormatterConfig>,
-        /// Named agent definitions (overrides built-in defaults).
+        #[serde(default)]
+        pub commands: HashMap<String, CommandTemplate>,
         #[serde(default)]
         pub agents: HashMap<String, AgentConfig>,
-        /// Skill-discovery configuration (extra paths and git URLs).
         #[serde(default)]
         pub skills: SkillsConfig,
-        /// Managed agent (manager-executor) configuration.
         #[serde(default)]
         pub managed_agents: Option<ManagedAgentConfig>,
+        #[serde(default)]
+        pub tool_visibility: ToolVisibility,
+
+        // ── Metadata ──
+        pub version: Option<u32>,
+        #[serde(default, rename = "remoteControlAtStartup")]
+        pub remote_control_at_startup: bool,
+        #[serde(default, rename = "permissionRules")]
+        pub permission_rules: Vec<crate::permissions::SerializedPermissionRule>,
+        #[serde(default, rename = "enabledPlugins")]
+        pub enabled_plugins: std::collections::HashSet<String>,
+        #[serde(default, rename = "disabledPlugins")]
+        pub disabled_plugins: std::collections::HashSet<String>,
+        #[serde(default, rename = "hasCompletedOnboarding")]
+        pub has_completed_onboarding: bool,
+        #[serde(default, rename = "lastSeenVersion")]
+        pub last_seen_version: Option<String>,
+
+        // ── Forward compatibility ──
+        #[serde(flatten)]
+        pub extra: HashMap<String, serde_json::Value>,
     }
+
+    /// Temporary alias for backward compatibility during migration.
+    /// All `Config` fields now live directly in `Settings`.
+    pub type Config = Settings;
 
     /// A user-defined slash command template.
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1181,6 +1237,202 @@ pub mod config {
         #[serde(default)]
         pub mcp_servers: Vec<McpServerConfig>,
         pub custom_system_prompt: Option<String>,
+        pub append_system_prompt: Option<String>,
+        pub provider: Option<String>,
+        pub model: Option<String>,
+        pub agent: Option<String>,
+        #[serde(default)]
+        pub env: HashMap<String, String>,
+        #[serde(default)]
+        pub permission_rules: Vec<crate::permissions::SerializedPermissionRule>,
+        pub default_agent: Option<String>,
+    }
+
+    /// Per-session metadata stored in `~/.claurst/sessions/<id>.json`.
+    /// Full message history stays in `~/.claurst/sessions/<id>.jsonl`.
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct SessionConfig {
+        pub model: Option<String>,
+        pub provider: Option<String>,
+        pub agent: Option<String>,
+        pub working_dir: Option<PathBuf>,
+        pub created_at: Option<String>,
+        pub last_active: Option<String>,
+    }
+
+    // ---- Scope classes -----------------------------------------------------
+
+    /// Global scope — loads from `~/.claurst/settings.json`.
+    /// Holds the full `Settings` (which is the flattened former `Config`).
+    #[derive(Debug, Clone)]
+    pub struct GlobalScope {
+        pub config: Settings,
+    }
+
+    impl GlobalScope {
+        pub fn path() -> PathBuf {
+            Settings::global_settings_path()
+        }
+
+        pub async fn load() -> anyhow::Result<Self> {
+            let config = Settings::load().await?;
+            Ok(Self { config })
+        }
+
+        pub async fn save(&self) -> anyhow::Result<()> {
+            self.config.save().await
+        }
+
+        pub fn load_sync() -> anyhow::Result<Self> {
+            let config = Settings::load_sync()?;
+            Ok(Self { config })
+        }
+
+        pub fn save_sync(&self) -> anyhow::Result<()> {
+            self.config.save_sync()
+        }
+
+        // Typed accessors — delegate to Settings
+        pub fn provider(&self) -> Option<&str> { self.config.provider.as_deref() }
+        pub fn model(&self) -> Option<&str> { self.config.model.as_deref() }
+        pub fn agent(&self) -> Option<&str> { self.config.agent.as_deref() }
+        pub fn max_tokens(&self) -> Option<u32> { self.config.max_tokens }
+        pub fn permission_mode(&self) -> PermissionMode { self.config.permission_mode.clone() }
+        pub fn theme(&self) -> Theme { self.config.theme.clone() }
+        pub fn verbose(&self) -> bool { self.config.verbose }
+        pub fn auto_compact(&self) -> bool { self.config.auto_compact }
+        pub fn output_format(&self) -> OutputFormat { self.config.output_format.clone() }
+        pub fn mcp_servers(&self) -> &Vec<McpServerConfig> { &self.config.mcp_servers }
+        pub fn env(&self) -> &HashMap<String, String> { &self.config.env }
+        pub fn workspace_paths(&self) -> &Vec<PathBuf> { &self.config.workspace_paths }
+        pub fn provider_configs(&self) -> &HashMap<String, ProviderConfig> { &self.config.provider_configs }
+        pub fn agents(&self) -> &HashMap<String, AgentConfig> { &self.config.agents }
+        pub fn commands(&self) -> &HashMap<String, CommandTemplate> { &self.config.commands }
+        pub fn skills(&self) -> &SkillsConfig { &self.config.skills }
+        pub fn hooks(&self) -> &HashMap<HookEvent, Vec<HookEntry>> { &self.config.hooks }
+        pub fn permission_rules(&self) -> &Vec<crate::permissions::SerializedPermissionRule> { &self.config.permission_rules }
+        pub fn custom_system_prompt(&self) -> Option<&str> { self.config.custom_system_prompt.as_deref() }
+        pub fn append_system_prompt(&self) -> Option<&str> { self.config.append_system_prompt.as_deref() }
+        pub fn allowed_tools(&self) -> &Vec<String> { &self.config.allowed_tools }
+        pub fn disallowed_tools(&self) -> &Vec<String> { &self.config.disallowed_tools }
+        pub fn formatter(&self) -> &HashMap<String, FormatterConfig> { &self.config.formatter }
+        pub fn project_dir(&self) -> Option<&PathBuf> { self.config.project_dir.as_ref() }
+        pub fn additional_dirs(&self) -> &Vec<PathBuf> { &self.config.additional_dirs }
+        pub fn lsp_servers(&self) -> &Vec<crate::lsp::LspServerConfig> { &self.config.lsp_servers }
+        pub fn enable_all_mcp_servers(&self) -> bool { self.config.enable_all_mcp_servers }
+        pub fn disable_claude_mds(&self) -> bool { self.config.disable_claude_mds }
+        pub fn managed_agents(&self) -> &Option<ManagedAgentConfig> { &self.config.managed_agents }
+        pub fn tool_visibility(&self) -> ToolVisibility { self.config.tool_visibility.clone() }
+        pub fn remote_control_at_startup(&self) -> bool { self.config.remote_control_at_startup }
+        pub fn has_completed_onboarding(&self) -> bool { self.config.has_completed_onboarding }
+        pub fn last_seen_version(&self) -> Option<&str> { self.config.last_seen_version.as_deref() }
+        pub fn version(&self) -> Option<u32> { self.config.version }
+        pub fn compact_threshold(&self) -> f32 { self.config.compact_threshold }
+        pub fn output_style(&self) -> Option<&str> { self.config.output_style.as_deref() }
+        pub fn enabled_plugins(&self) -> &std::collections::HashSet<String> { &self.config.enabled_plugins }
+        pub fn disabled_plugins(&self) -> &std::collections::HashSet<String> { &self.config.disabled_plugins }
+    }
+
+    /// Project scope — loads from `<project_root>/.claurst/settings.json`.
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct ProjectScope {
+        pub config: ProjectSettings,
+    }
+
+    impl ProjectScope {
+        pub fn from_dir(dir: &std::path::Path) -> Option<Self> {
+            let path = dir.join(".claurst").join("settings.json");
+            if !path.exists() {
+                return None;
+            }
+            let content = std::fs::read_to_string(&path).ok()?;
+            let config: ProjectSettings = serde_json::from_str(&content).ok()?;
+            Some(Self { config })
+        }
+
+        pub async fn from_dir_async(dir: &std::path::Path) -> Option<Self> {
+            let path = dir.join(".claurst").join("settings.json");
+            if !path.exists() {
+                return None;
+            }
+            let content = tokio::fs::read_to_string(&path).await.ok()?;
+            let config: ProjectSettings = serde_json::from_str(&content).ok()?;
+            Some(Self { config })
+        }
+
+        pub fn save_to_dir(&self, dir: &std::path::Path) -> anyhow::Result<()> {
+            let path = dir.join(".claurst").join("settings.json");
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let content = serde_json::to_string_pretty(&self.config)?;
+            std::fs::write(&path, content)?;
+            Ok(())
+        }
+
+        // Typed accessors
+        pub fn allowed_tools(&self) -> &Vec<String> { &self.config.allowed_tools }
+        pub fn mcp_servers(&self) -> &Vec<McpServerConfig> { &self.config.mcp_servers }
+        pub fn custom_system_prompt(&self) -> Option<&str> { self.config.custom_system_prompt.as_deref() }
+        pub fn append_system_prompt(&self) -> Option<&str> { self.config.append_system_prompt.as_deref() }
+        pub fn provider(&self) -> Option<&str> { self.config.provider.as_deref() }
+        pub fn model(&self) -> Option<&str> { self.config.model.as_deref() }
+        pub fn agent(&self) -> Option<&str> { self.config.agent.as_deref() }
+        pub fn env(&self) -> &HashMap<String, String> { &self.config.env }
+        pub fn permission_rules(&self) -> &Vec<crate::permissions::SerializedPermissionRule> { &self.config.permission_rules }
+        pub fn default_agent(&self) -> Option<&str> { self.config.default_agent.as_deref() }
+    }
+
+    /// Session scope — loads from `~/.claurst/sessions/<id>.json`.
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct SessionScope {
+        pub config: SessionConfig,
+    }
+
+    impl SessionScope {
+        pub fn path(session_id: &str) -> PathBuf {
+            Settings::config_dir().join("sessions").join(format!("{}.json", session_id))
+        }
+
+        pub fn load(session_id: &str) -> anyhow::Result<Self> {
+            let path = Self::path(session_id);
+            let content = std::fs::read_to_string(&path)?;
+            let config: SessionConfig = serde_json::from_str(&content)?;
+            Ok(Self { config })
+        }
+
+        pub fn save(&self, session_id: &str) -> anyhow::Result<()> {
+            let path = Self::path(session_id);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let content = serde_json::to_string_pretty(&self.config)?;
+            std::fs::write(&path, content)?;
+            Ok(())
+        }
+
+        // Typed accessors
+        pub fn model(&self) -> Option<&str> { self.config.model.as_deref() }
+        pub fn provider(&self) -> Option<&str> { self.config.provider.as_deref() }
+        pub fn agent(&self) -> Option<&str> { self.config.agent.as_deref() }
+        pub fn working_dir(&self) -> Option<&PathBuf> { self.config.working_dir.as_ref() }
+        pub fn created_at(&self) -> Option<&str> { self.config.created_at.as_deref() }
+        pub fn last_active(&self) -> Option<&str> { self.config.last_active.as_deref() }
+    }
+
+    /// "Once" scope — in-memory ephemeral overrides.
+    /// Reuses the existing `EphemeralOverrides` struct.
+    #[derive(Debug, Clone, Default)]
+    pub struct OnceScope {
+        pub config: crate::live_session::EphemeralOverrides,
+    }
+
+    impl OnceScope {
+        // Typed accessors
+        pub fn model(&self) -> Option<&str> { self.config.model.as_deref() }
+        pub fn provider(&self) -> Option<&str> { self.config.provider.as_deref() }
+        pub fn output_style(&self) -> Option<&str> { self.config.output_style.as_deref() }
+        pub fn effort(&self) -> Option<&str> { self.config.effort.as_deref() }
     }
 
     /// Return the three built-in named agent definitions.
@@ -1213,7 +1465,372 @@ pub mod config {
         m
     }
 
-    impl Config {
+    // ---- ConfigResolver ----------------------------------------------------
+
+    /// Holds all four configuration scopes and resolves effective values by
+    /// walking the hierarchy: once → session → project → global.
+    #[derive(Debug, Clone)]
+    pub struct ConfigResolver {
+        pub global: GlobalScope,
+        pub project: Option<ProjectScope>,
+        pub session: Option<SessionScope>,
+        pub once: OnceScope,
+    }
+
+    impl ConfigResolver {
+        /// Build a resolver from just the global scope (no project/session/once).
+        pub fn from_global(global: GlobalScope) -> Self {
+            Self {
+                global,
+                project: None,
+                session: None,
+                once: OnceScope::default(),
+            }
+        }
+
+        /// Build a resolver with global + project (typical CLI startup).
+        pub fn from_global_and_project(global: GlobalScope, project: Option<ProjectScope>) -> Self {
+            Self {
+                global,
+                project,
+                session: None,
+                once: OnceScope::default(),
+            }
+        }
+
+        // -- provider --
+        pub fn provider(&self) -> Option<&str> {
+            self.once.provider()
+                .or_else(|| self.session.as_ref().and_then(|s| s.provider()))
+                .or_else(|| self.project.as_ref().and_then(|p| p.provider()))
+                .or_else(|| self.global.provider())
+        }
+
+        // -- model --
+        pub fn model(&self) -> Option<&str> {
+            self.once.model()
+                .or_else(|| self.session.as_ref().and_then(|s| s.model()))
+                .or_else(|| self.project.as_ref().and_then(|p| p.model()))
+                .or_else(|| self.global.model())
+        }
+
+        // -- agent --
+        pub fn agent(&self) -> Option<&str> {
+            self.session.as_ref().and_then(|s| s.agent())
+                .or_else(|| self.project.as_ref().and_then(|p| p.agent()))
+                .or_else(|| self.global.agent())
+        }
+
+        // -- max_tokens --
+        pub fn max_tokens(&self) -> Option<u32> {
+            self.global.max_tokens()
+        }
+
+        // -- permission_mode --
+        pub fn permission_mode(&self) -> PermissionMode {
+            self.global.permission_mode()
+        }
+
+        // -- theme --
+        pub fn theme(&self) -> Theme {
+            self.global.theme()
+        }
+
+        // -- verbose --
+        pub fn verbose(&self) -> bool {
+            self.global.verbose()
+        }
+
+        // -- auto_compact --
+        pub fn auto_compact(&self) -> bool {
+            self.global.auto_compact()
+        }
+
+        // -- output_format --
+        pub fn output_format(&self) -> OutputFormat {
+            self.global.output_format()
+        }
+
+        // -- mcp_servers (merged: global + project) --
+        pub fn mcp_servers(&self) -> Vec<McpServerConfig> {
+            let mut servers = self.global.mcp_servers().clone();
+            if let Some(ref p) = self.project {
+                servers.extend(p.mcp_servers().iter().cloned());
+            }
+            servers
+        }
+
+        // -- env (merged: global + project) --
+        pub fn env(&self) -> HashMap<String, String> {
+            let mut env = self.global.env().clone();
+            if let Some(ref p) = self.project {
+                env.extend(p.env().iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+            env
+        }
+
+        // -- workspace_paths --
+        pub fn workspace_paths(&self) -> &Vec<PathBuf> {
+            self.global.workspace_paths()
+        }
+
+        // -- provider_configs --
+        pub fn provider_configs(&self) -> &HashMap<String, ProviderConfig> {
+            self.global.provider_configs()
+        }
+
+        // -- agents (global only for now; ephemeral handled separately) --
+        pub fn agents(&self) -> &HashMap<String, AgentConfig> {
+            self.global.agents()
+        }
+
+        // -- commands --
+        pub fn commands(&self) -> &HashMap<String, CommandTemplate> {
+            self.global.commands()
+        }
+
+        // -- skills --
+        pub fn skills(&self) -> &SkillsConfig {
+            self.global.skills()
+        }
+
+        // -- hooks --
+        pub fn hooks(&self) -> &HashMap<HookEvent, Vec<HookEntry>> {
+            self.global.hooks()
+        }
+
+        // -- permission_rules (merged: global + project) --
+        pub fn permission_rules(&self) -> Vec<crate::permissions::SerializedPermissionRule> {
+            let mut rules = self.global.permission_rules().clone();
+            if let Some(ref p) = self.project {
+                rules.extend(p.permission_rules().iter().cloned());
+            }
+            rules
+        }
+
+        // -- custom_system_prompt (project wins over global) --
+        pub fn custom_system_prompt(&self) -> Option<&str> {
+            self.project.as_ref().and_then(|p| p.custom_system_prompt())
+                .or_else(|| self.global.custom_system_prompt())
+        }
+
+        // -- append_system_prompt (project wins over global) --
+        pub fn append_system_prompt(&self) -> Option<&str> {
+            self.project.as_ref().and_then(|p| p.append_system_prompt())
+                .or_else(|| self.global.append_system_prompt())
+        }
+
+        // -- allowed_tools (merged: global + project) --
+        pub fn allowed_tools(&self) -> Vec<String> {
+            let mut tools = self.global.allowed_tools().clone();
+            if let Some(ref p) = self.project {
+                tools.extend(p.allowed_tools().iter().cloned());
+            }
+            tools
+        }
+
+        // -- disallowed_tools --
+        pub fn disallowed_tools(&self) -> &Vec<String> {
+            self.global.disallowed_tools()
+        }
+
+        // -- formatter --
+        pub fn formatter(&self) -> &HashMap<String, FormatterConfig> {
+            self.global.formatter()
+        }
+
+        // -- project_dir --
+        pub fn project_dir(&self) -> Option<&PathBuf> {
+            self.global.project_dir()
+        }
+
+        // -- additional_dirs --
+        pub fn additional_dirs(&self) -> &Vec<PathBuf> {
+            self.global.additional_dirs()
+        }
+
+        // -- lsp_servers --
+        pub fn lsp_servers(&self) -> &Vec<crate::lsp::LspServerConfig> {
+            self.global.lsp_servers()
+        }
+
+        // -- enable_all_mcp_servers --
+        pub fn enable_all_mcp_servers(&self) -> bool {
+            self.global.enable_all_mcp_servers()
+        }
+
+        // -- disable_claude_mds --
+        pub fn disable_claude_mds(&self) -> bool {
+            self.global.disable_claude_mds()
+        }
+
+        // -- managed_agents --
+        pub fn managed_agents(&self) -> &Option<ManagedAgentConfig> {
+            self.global.managed_agents()
+        }
+
+        // -- tool_visibility --
+        pub fn tool_visibility(&self) -> ToolVisibility {
+            self.global.tool_visibility()
+        }
+
+        // -- remote_control_at_startup --
+        pub fn remote_control_at_startup(&self) -> bool {
+            self.global.remote_control_at_startup()
+        }
+
+        // -- has_completed_onboarding --
+        pub fn has_completed_onboarding(&self) -> bool {
+            self.global.has_completed_onboarding()
+        }
+
+        // -- last_seen_version --
+        pub fn last_seen_version(&self) -> Option<&str> {
+            self.global.last_seen_version()
+        }
+
+        // -- version --
+        pub fn version(&self) -> Option<u32> {
+            self.global.version()
+        }
+
+        // -- compact_threshold --
+        pub fn compact_threshold(&self) -> f32 {
+            self.global.compact_threshold()
+        }
+
+        // -- output_style (once wins, then global) --
+        pub fn output_style(&self) -> Option<&str> {
+            self.once.output_style()
+                .or_else(|| self.global.output_style())
+        }
+
+        // -- enabled_plugins --
+        pub fn enabled_plugins(&self) -> &std::collections::HashSet<String> {
+            self.global.enabled_plugins()
+        }
+
+        // -- disabled_plugins --
+        pub fn disabled_plugins(&self) -> &std::collections::HashSet<String> {
+            self.global.disabled_plugins()
+        }
+
+        /// Resolve the effective provider ID using the same logic as Settings.
+        pub fn selected_provider_id(&self) -> String {
+            self.provider()
+                .map(String::from)
+                .or_else(|| {
+                    self.model()
+                        .and_then(|model| model.split_once('/').map(|(provider, _)| provider.to_string()))
+                })
+                .unwrap_or_else(|| "anthropic".to_string())
+        }
+
+        /// Resolve the effective model, falling back to provider-appropriate defaults.
+        pub fn effective_model(&self) -> String {
+            if let Some(m) = self.model() {
+                return m.to_string();
+            }
+            match self.provider() {
+                Some("openai") => "gpt-4o".to_string(),
+                Some("google") => "gemini-2.5-flash".to_string(),
+                Some("groq") => "llama-3.3-70b-versatile".to_string(),
+                Some("cerebras") => "llama-3.3-70b".to_string(),
+                Some("deepseek") => "deepseek-chat".to_string(),
+                Some("mistral") => "mistral-large-latest".to_string(),
+                Some("xai") => "grok-2".to_string(),
+                Some("openrouter") => "anthropic/claude-sonnet-4".to_string(),
+                Some("togetherai") | Some("together-ai") => "meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),
+                Some("perplexity") => "sonar-pro".to_string(),
+                Some("cohere") => "command-r-plus".to_string(),
+                Some("deepinfra") => "meta-llama/Llama-3.3-70B-Instruct".to_string(),
+                Some("github-copilot") => "gpt-4o".to_string(),
+                Some("ollama") => "llama3.2".to_string(),
+                Some("lmstudio") => "default".to_string(),
+                Some("llamacpp") => "default".to_string(),
+                Some("custom-openai") => "default".to_string(),
+                Some("azure") => "gpt-4o".to_string(),
+                Some("amazon-bedrock") => "anthropic.claude-sonnet-4-6-v1".to_string(),
+                Some("venice") => "llama-3.3-70b".to_string(),
+                _ => crate::constants::DEFAULT_MODEL.to_string(),
+            }
+        }
+
+        /// Resolve the effective max-tokens.
+        pub fn effective_max_tokens(&self) -> u32 {
+            self.max_tokens()
+                .unwrap_or(crate::constants::DEFAULT_MAX_TOKENS)
+        }
+
+        /// Resolve the effective compact threshold.
+        pub fn effective_compact_threshold(&self) -> f32 {
+            let ct = self.compact_threshold();
+            if ct > 0.0 { ct } else { crate::constants::DEFAULT_COMPACT_THRESHOLD }
+        }
+
+        /// Resolve the effective output style.
+        pub fn effective_output_style(&self) -> crate::system_prompt::OutputStyle {
+            self.output_style()
+                .map(crate::system_prompt::OutputStyle::from_str)
+                .unwrap_or_default()
+        }
+
+        /// Resolve the API key for a specific provider.
+        pub fn resolve_provider_api_key(&self, provider_id: &str) -> Option<String> {
+            let provider_cfg = self.provider_configs().get(provider_id);
+            if provider_cfg.is_some_and(|p| !p.enabled) {
+                return None;
+            }
+            provider_cfg
+                .and_then(|p| p.api_key.clone())
+                .filter(|k| !k.is_empty())
+                .or_else(|| {
+                    api_key_env_vars_for_provider(provider_id)
+                        .iter()
+                        .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
+                })
+                .or_else(|| crate::AuthStore::load().api_key_for(provider_id))
+        }
+
+        /// Resolve the API key for the active provider.
+        pub fn resolve_api_key(&self) -> Option<String> {
+            self.resolve_provider_api_key(&self.selected_provider_id())
+        }
+
+        /// Async auth resolution (includes OAuth token check for anthropic).
+        pub async fn resolve_auth_async(&self) -> Option<(String, bool)> {
+            if self.selected_provider_id() != "anthropic" {
+                return self.resolve_api_key().map(|k| (k, false));
+            }
+            // Delegate to Settings method for OAuth refresh logic
+            self.global.config.resolve_anthropic_auth_async().await
+        }
+
+        /// Resolve the API base for a specific provider.
+        pub fn resolve_provider_api_base(&self, provider_id: &str) -> Option<String> {
+            let provider_cfg = self.provider_configs().get(provider_id);
+            if provider_cfg.is_some_and(|p| !p.enabled) {
+                return None;
+            }
+            provider_cfg
+                .and_then(|p| p.api_base.clone())
+                .filter(|b| !b.is_empty())
+                .or_else(|| {
+                    api_base_env_var_for_provider(provider_id)
+                        .and_then(|name| std::env::var(name).ok())
+                        .filter(|b| !b.is_empty())
+                })
+                .or_else(|| default_api_base_for_provider(provider_id).map(str::to_owned))
+        }
+
+        /// Resolve the API base for the active provider.
+        pub fn resolve_api_base(&self) -> String {
+            self.resolve_provider_api_base(&self.selected_provider_id())
+                .unwrap_or_else(|| crate::constants::ANTHROPIC_API_BASE.to_string())
+        }
+    }
+
+    impl Settings {
         pub fn selected_provider_id(&self) -> &str {
             self.provider
                 .as_deref()
@@ -1300,19 +1917,9 @@ pub mod config {
                 return None;
             }
 
-            let top_level_key = if provider_id == self.selected_provider_id() {
-                self.api_key.clone()
-            } else {
-                None
-            };
-
-            top_level_key
+            provider_cfg
+                .and_then(|provider| provider.api_key.clone())
                 .filter(|key| !key.is_empty())
-                .or_else(|| {
-                    provider_cfg
-                        .and_then(|provider| provider.api_key.clone())
-                        .filter(|key| !key.is_empty())
-                })
                 .or_else(|| {
                     api_key_env_vars_for_provider(provider_id)
                         .iter()
@@ -1322,15 +1929,10 @@ pub mod config {
         }
 
         pub fn resolve_anthropic_api_key(&self) -> Option<String> {
-            self.api_key
-                .clone()
+            self.provider_configs
+                .get("anthropic")
+                .and_then(|provider| provider.api_key.clone())
                 .filter(|key| !key.is_empty())
-                .or_else(|| {
-                    self.provider_configs
-                        .get("anthropic")
-                        .and_then(|provider| provider.api_key.clone())
-                        .filter(|key| !key.is_empty())
-                })
                 .or_else(|| {
                     api_key_env_vars_for_provider("anthropic")
                         .iter()
@@ -1444,9 +2046,6 @@ pub mod config {
             self.resolve_provider_api_base(self.selected_provider_id())
                 .unwrap_or_else(|| self.resolve_anthropic_api_base())
         }
-    }
-
-    impl Settings {
         /// The per-user configuration directory (`~/.claurst`).
         pub fn config_dir() -> PathBuf {
             dirs::home_dir()
@@ -1460,11 +2059,12 @@ pub mod config {
         }
 
         /// Load settings from disk, returning defaults when the file is missing.
+        /// Warns about unknown fields and preserves them for round-trip.
         pub async fn load() -> anyhow::Result<Self> {
             let path = Self::global_settings_path();
             if path.exists() {
                 let content = tokio::fs::read_to_string(&path).await?;
-                Ok(serde_json::from_str(&content).unwrap_or_default())
+                Self::from_str_with_warnings(&content, &path)
             } else {
                 Ok(Self::default())
             }
@@ -1486,7 +2086,7 @@ pub mod config {
             let path = Self::global_settings_path();
             if path.exists() {
                 let content = std::fs::read_to_string(&path)?;
-                Ok(serde_json::from_str(&content).unwrap_or_default())
+                Self::from_str_with_warnings(&content, &path)
             } else {
                 Ok(Self::default())
             }
@@ -1503,45 +2103,32 @@ pub mod config {
             Ok(())
         }
 
-        /// Return the effective `Config`, merging top-level provider settings
-        /// into the embedded `config` field.
-        ///
-        /// - `settings.provider` wins over `settings.config.provider` (if set).
-        /// - `settings.providers` entries are merged into `config.provider_configs`,
-        ///   with the embedded config values taking precedence for keys already present.
-        pub fn effective_config(&self) -> Config {
-            let mut config = self.config.clone();
-            // Top-level `provider` key overrides config.provider when set.
-            if self.provider.is_some() && config.provider.is_none() {
-                config.provider = self.provider.clone();
+        /// Deserialize from JSON string, warn about unknown fields, and preserve
+        /// them in the `extra` map for round-trip.
+        fn from_str_with_warnings(content: &str, path: &std::path::Path) -> anyhow::Result<Self> {
+            let raw: serde_json::Value = serde_json::from_str(content)
+                .map_err(|e| anyhow::anyhow!("{}: invalid JSON — {}", path.display(), e))?;
+
+            // Collect unknown fields at the Settings level.
+            let mut warnings: Vec<String> = Vec::new();
+            let settings: Self = serde_ignored::deserialize(&raw, |path| {
+                warnings.push(path.to_string());
+            }).map_err(|e| anyhow::anyhow!("{}: invalid settings structure — {}", path.display(), e))?;
+
+            if !warnings.is_empty() {
+                eprintln!(
+                    "⚠️  Warning: unknown fields in {} (ignored): {}",
+                    path.display(),
+                    warnings.join(", ")
+                );
             }
-            // Merge top-level `providers` map into config.provider_configs.
-            for (id, pc) in &self.providers {
-                config.provider_configs.entry(id.clone()).or_insert_with(|| pc.clone());
-            }
-            // Copy top-level formatters and commands into config.
-            for (k, v) in &self.formatter {
-                config.formatter.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-            for (k, v) in &self.commands {
-                config.commands.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-            // Copy top-level agent definitions into config.
-            for (k, v) in &self.agents {
-                config.agents.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-            // Copy skills config into effective config (paths and urls merged).
-            for p in &self.skills.paths {
-                if !config.skills.paths.contains(p) {
-                    config.skills.paths.push(p.clone());
-                }
-            }
-            for u in &self.skills.urls {
-                if !config.skills.urls.contains(u) {
-                    config.skills.urls.push(u.clone());
-                }
-            }
-            config
+
+            Ok(settings)
+        }
+
+        /// Return the effective config (now just `self` since Config is flattened into Settings).
+        pub fn effective_config(&self) -> Self {
+            self.clone()
         }
 
         /// Load settings from all config levels and merge them.
@@ -1568,7 +2155,7 @@ pub mod config {
                     if candidate.exists() && candidate != global_path {
                         if let Ok(content) = tokio::fs::read_to_string(&candidate).await {
                             let stripped = strip_jsonc_comments(&content);
-                            if let Ok(s) = serde_json::from_str::<Self>(&stripped) {
+                            if let Ok(s) = Self::from_str_with_warnings(&stripped, &candidate) {
                                 return Some(s);
                             }
                         }
@@ -1596,63 +2183,40 @@ pub mod config {
                 for (k, v) in over { base.insert(k, v); }
                 base
             }
-            // Merge the embedded Config structs.
-            let merged_config = Config {
-                api_key: over.config.api_key.or(base.config.api_key),
-                model: over.config.model.or(base.config.model),
-                max_tokens: over.config.max_tokens.or(base.config.max_tokens),
-                permission_mode: over.config.permission_mode,
-                theme: over.config.theme,
-                output_style: over.config.output_style.or(base.config.output_style),
-                auto_compact: over.config.auto_compact || base.config.auto_compact,
-                compact_threshold: if over.config.compact_threshold != 0.0 {
-                    over.config.compact_threshold
-                } else {
-                    base.config.compact_threshold
-                },
-                verbose: over.config.verbose || base.config.verbose,
-                output_format: over.config.output_format,
-                mcp_servers: { let mut v = base.config.mcp_servers; v.extend(over.config.mcp_servers); v },
-                lsp_servers: { let mut v = base.config.lsp_servers; v.extend(over.config.lsp_servers); v },
-                allowed_tools: { let mut v = base.config.allowed_tools; v.extend(over.config.allowed_tools); v.dedup(); v },
-                disallowed_tools: { let mut v = base.config.disallowed_tools; v.extend(over.config.disallowed_tools); v.dedup(); v },
-                env: merge_map(base.config.env, over.config.env),
-                enable_all_mcp_servers: over.config.enable_all_mcp_servers || base.config.enable_all_mcp_servers,
-                custom_system_prompt: over.config.custom_system_prompt.or(base.config.custom_system_prompt),
-                append_system_prompt: over.config.append_system_prompt.or(base.config.append_system_prompt),
-                disable_claude_mds: over.config.disable_claude_mds || base.config.disable_claude_mds,
-                project_dir: over.config.project_dir.or(base.config.project_dir),
-                workspace_paths: { let mut v = base.config.workspace_paths; v.extend(over.config.workspace_paths); v },
-                additional_dirs: { let mut v = base.config.additional_dirs; v.extend(over.config.additional_dirs); v },
-                hooks: merge_map(base.config.hooks, over.config.hooks),
-                provider: over.config.provider.or(base.config.provider),
-                provider_configs: merge_map(base.config.provider_configs, over.config.provider_configs),
-                formatter: merge_map(base.config.formatter, over.config.formatter),
-                commands: merge_map(base.config.commands, over.config.commands),
-                agents: merge_map(base.config.agents, over.config.agents),
-                skills: {
-                    let mut paths = base.config.skills.paths;
-                    for p in over.config.skills.paths { if !paths.contains(&p) { paths.push(p); } }
-                    let mut urls = base.config.skills.urls;
-                    for u in over.config.skills.urls { if !urls.contains(&u) { urls.push(u); } }
-                    SkillsConfig { paths, urls }
-                },
-                managed_agents: over.config.managed_agents.or(base.config.managed_agents),
-            };
             Self {
-                config: merged_config,
-                version: over.version.or(base.version),
-                projects: merge_map(base.projects, over.projects),
-                remote_control_at_startup: over.remote_control_at_startup || base.remote_control_at_startup,
-                permission_rules: { let mut v = base.permission_rules; v.extend(over.permission_rules); v },
-                enabled_plugins: { let mut s = base.enabled_plugins; s.extend(over.enabled_plugins); s },
-                disabled_plugins: { let mut s = base.disabled_plugins; s.extend(over.disabled_plugins); s },
-                has_completed_onboarding: over.has_completed_onboarding || base.has_completed_onboarding,
-                last_seen_version: over.last_seen_version.or(base.last_seen_version),
                 provider: over.provider.or(base.provider),
-                providers: merge_map(base.providers, over.providers),
-                commands: merge_map(base.commands, over.commands),
+                model: over.model.or(base.model),
+                agent: over.agent.or(base.agent),
+                project: over.project.or(base.project),
+                session: over.session.or(base.session),
+                max_tokens: over.max_tokens.or(base.max_tokens),
+                permission_mode: over.permission_mode,
+                theme: over.theme,
+                output_style: over.output_style.or(base.output_style),
+                auto_compact: over.auto_compact || base.auto_compact,
+                compact_threshold: if over.compact_threshold != 0.0 {
+                    over.compact_threshold
+                } else {
+                    base.compact_threshold
+                },
+                verbose: over.verbose || base.verbose,
+                output_format: over.output_format,
+                mcp_servers: { let mut v = base.mcp_servers; v.extend(over.mcp_servers); v },
+                lsp_servers: { let mut v = base.lsp_servers; v.extend(over.lsp_servers); v },
+                allowed_tools: { let mut v = base.allowed_tools; v.extend(over.allowed_tools); v.dedup(); v },
+                disallowed_tools: { let mut v = base.disallowed_tools; v.extend(over.disallowed_tools); v.dedup(); v },
+                env: merge_map(base.env, over.env),
+                enable_all_mcp_servers: over.enable_all_mcp_servers || base.enable_all_mcp_servers,
+                custom_system_prompt: over.custom_system_prompt.or(base.custom_system_prompt),
+                append_system_prompt: over.append_system_prompt.or(base.append_system_prompt),
+                disable_claude_mds: over.disable_claude_mds || base.disable_claude_mds,
+                project_dir: over.project_dir.or(base.project_dir),
+                workspace_paths: { let mut v = base.workspace_paths; v.extend(over.workspace_paths); v },
+                additional_dirs: { let mut v = base.additional_dirs; v.extend(over.additional_dirs); v },
+                hooks: merge_map(base.hooks, over.hooks),
+                provider_configs: merge_map(base.provider_configs, over.provider_configs),
                 formatter: merge_map(base.formatter, over.formatter),
+                commands: merge_map(base.commands, over.commands),
                 agents: merge_map(base.agents, over.agents),
                 skills: {
                     let mut paths = base.skills.paths;
@@ -1662,6 +2226,15 @@ pub mod config {
                     SkillsConfig { paths, urls }
                 },
                 managed_agents: over.managed_agents.or(base.managed_agents),
+                tool_visibility: over.tool_visibility,
+                version: over.version.or(base.version),
+                remote_control_at_startup: over.remote_control_at_startup || base.remote_control_at_startup,
+                permission_rules: { let mut v = base.permission_rules; v.extend(over.permission_rules); v },
+                enabled_plugins: { let mut s = base.enabled_plugins; s.extend(over.enabled_plugins); s },
+                disabled_plugins: { let mut s = base.disabled_plugins; s.extend(over.disabled_plugins); s },
+                has_completed_onboarding: over.has_completed_onboarding || base.has_completed_onboarding,
+                last_seen_version: over.last_seen_version.or(base.last_seen_version),
+                extra: merge_map(base.extra, over.extra),
             }
         }
     }
@@ -4268,13 +4841,16 @@ mod tests {
 
     #[test]
     fn test_config_resolve_api_key_from_config() {
-        // When config.api_key is set, it should be returned regardless of env var
-        // (Config key takes priority — resolve_api_key returns it first)
+        // When provider_configs["anthropic"].api_key is set, it should be returned
+        // regardless of env var.
         let orig = std::env::var("ANTHROPIC_API_KEY").ok();
         std::env::remove_var("ANTHROPIC_API_KEY");
 
         let mut cfg = crate::config::Config::default();
-        cfg.api_key = Some("sk-ant-config-key".to_string());
+        cfg.provider_configs
+            .entry("anthropic".to_string())
+            .or_default()
+            .api_key = Some("sk-ant-config-key".to_string());
         assert_eq!(cfg.resolve_api_key(), Some("sk-ant-config-key".to_string()));
 
         if let Some(k) = orig {

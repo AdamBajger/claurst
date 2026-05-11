@@ -86,7 +86,7 @@ impl Tool for ConfigTool {
                         Some(s) => s.to_string(),
                         None => return ToolResult::error("'model' must be a string".to_string()),
                     };
-                    settings.config.model = Some(s.clone());
+                    settings.model = Some(s.clone());
                     if let Err(e) = settings.save().await {
                         return ToolResult::error(format!("Failed to save settings: {}", e));
                     }
@@ -97,7 +97,7 @@ impl Tool for ConfigTool {
                         Some(n) => n as u32,
                         None => return ToolResult::error("'max_tokens' must be a positive integer".to_string()),
                     };
-                    settings.config.max_tokens = Some(n);
+                    settings.max_tokens = Some(n);
                     if let Err(e) = settings.save().await {
                         return ToolResult::error(format!("Failed to save settings: {}", e));
                     }
@@ -108,7 +108,7 @@ impl Tool for ConfigTool {
                         Some(b) => b,
                         None => return ToolResult::error("'verbose' must be true or false".to_string()),
                     };
-                    settings.config.verbose = b;
+                    settings.verbose = b;
                     if let Err(e) = settings.save().await {
                         return ToolResult::error(format!("Failed to save settings: {}", e));
                     }
@@ -119,7 +119,7 @@ impl Tool for ConfigTool {
                         Some(b) => b,
                         None => return ToolResult::error("'auto_compact' must be true or false".to_string()),
                     };
-                    settings.config.auto_compact = b;
+                    settings.auto_compact = b;
                     if let Err(e) = settings.save().await {
                         return ToolResult::error(format!("Failed to save settings: {}", e));
                     }
@@ -145,7 +145,7 @@ impl Tool for ConfigTool {
                             ))
                         }
                     };
-                    settings.config.permission_mode = mode;
+                    settings.permission_mode = mode;
                     if let Err(e) = settings.save().await {
                         return ToolResult::error(format!("Failed to save settings: {}", e));
                     }
@@ -161,23 +161,23 @@ impl Tool for ConfigTool {
             match key {
                 "model" => ToolResult::success(format!(
                     "model = \"{}\"",
-                    settings.config.effective_model()
+                    settings.effective_model()
                 )),
                 "max_tokens" => ToolResult::success(format!(
                     "max_tokens = {}",
-                    settings.config.effective_max_tokens()
+                    settings.effective_max_tokens()
                 )),
                 "verbose" => ToolResult::success(format!(
                     "verbose = {}",
-                    settings.config.verbose
+                    settings.verbose
                 )),
                 "auto_compact" => ToolResult::success(format!(
                     "auto_compact = {}",
-                    settings.config.auto_compact
+                    settings.auto_compact
                 )),
                 "permission_mode" => ToolResult::success(format!(
                     "permission_mode = \"{}\"",
-                    permission_mode_str(&settings.config.permission_mode)
+                    permission_mode_str(&settings.permission_mode)
                 )),
                 _ => ToolResult::error(format!(
                     "Unknown setting '{}'. Use setting='list' to see all supported settings.",

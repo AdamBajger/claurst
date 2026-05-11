@@ -32,7 +32,7 @@ pub const ISSUES_EXPLAINER: &str = env!("ISSUES_EXPLAINER");
 
 use anyhow::Context;
 use claurst_core::{
-    config::{Config, PermissionMode, Settings},
+    config::{Config, ConfigResolver, GlobalScope, PermissionMode, ProjectScope, Settings},
     constants::APP_VERSION,
     context::ContextBuilder,
     cost::CostTracker,
@@ -443,6 +443,7 @@ fn spawn_background_slash_command(
 
     let bg_cmd_ctx = claurst_commands::CommandContext {
         config: cmd_ctx.config.clone(),
+        resolver: cmd_ctx.resolver.clone(),
         cost_tracker: cmd_ctx.cost_tracker.clone(),
         messages: cmd_ctx.messages.clone(),
         working_dir: cmd_ctx.working_dir.clone(),
@@ -570,12 +571,15 @@ async fn main() -> anyhow::Result<()> {
                 let settings = Settings::load().await.unwrap_or_default();
                 let _kairos_state = claurst_core::kairos_gate::initialize_runtime_state(
                     settings.has_completed_onboarding,
-                )
-                .await;
+                );
                 let config = settings.effective_config();
+                let resolver = ConfigResolver::from_global(
+                    GlobalScope { config: settings.clone() },
+                );
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let cmd_ctx = claurst_commands::CommandContext {
                     config,
+                    resolver,
                     cost_tracker: CostTracker::new(),
                     messages: vec![],
                     working_dir: cwd,
@@ -637,8 +641,21 @@ async fn main() -> anyhow::Result<()> {
 
     // Build effective config (CLI args override settings)
     let mut config = settings.effective_config();
+
+    // Build ConfigResolver for layered scope lookups.
+    // Project scope is discovered from cwd; session/once are empty at startup.
+    let project_scope = ProjectScope::from_dir_async(&cwd).await;
+    let resolver = ConfigResolver::from_global_and_project(
+        GlobalScope { config: settings.clone() },
+        project_scope,
+    );
     if let Some(ref key) = cli.api_key {
-        config.api_key = Some(key.clone());
+        let provider_id = config.selected_provider_id().to_string();
+        config
+            .provider_configs
+            .entry(provider_id)
+            .or_default()
+            .api_key = Some(key.clone());
     }
     if let Some(ref m) = cli.model {
         config.model = Some(m.clone());
@@ -721,8 +738,7 @@ async fn main() -> anyhow::Result<()> {
 
     let kairos_state = claurst_core::kairos_gate::initialize_runtime_state(
         settings.has_completed_onboarding,
-    )
-    .await;
+    );
     info!(
         kairos_brief = kairos_state.brief_enabled,
         kairos_channels = kairos_state.channels_enabled,
@@ -734,14 +750,14 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Initialize API client.
-    // Try config/env first; fall back to saved OAuth tokens.
+    // Try resolver (cascading scopes) first; fall back to saved OAuth tokens.
     // If no Anthropic credentials are found, check whether any other provider is
     // configured (OpenAI, Google, Ollama, Groq, etc.) — if so, proceed without
     // requiring Anthropic auth. Only launch the OAuth flow when Anthropic is
     // explicitly the intended provider and no key exists at all.
-    let active_provider = config.selected_provider_id();
+    let active_provider = resolver.selected_provider_id();
     let (api_key, use_bearer_auth) = if active_provider == "anthropic" {
-        match config.resolve_anthropic_auth_async().await {
+        match resolver.resolve_auth_async().await {
             Some(auth) => auth,
             None => {
                 if is_headless {
@@ -765,7 +781,7 @@ async fn main() -> anyhow::Result<()> {
 
     let client_config = claurst_api::client::ClientConfig {
         api_key: api_key.clone(),
-        api_base: config.resolve_anthropic_api_base(),
+        api_base: resolver.resolve_api_base(),
         use_bearer_auth,
         ..Default::default()
     };
@@ -780,6 +796,7 @@ async fn main() -> anyhow::Result<()> {
     // Bedrock, Azure, Copilot, Cohere, local providers) are registered when
     // their respective environment variables or auth store entries are found.
     let provider_registry = claurst_api::ProviderRegistry::from_config(&config, client_config);
+    // TODO(Phase 11): switch ProviderRegistry::from_config to accept ConfigResolver
 
     let bridge_config = resolve_bridge_config(&settings, &api_key, use_bearer_auth, is_headless);
     if let Some(cfg) = bridge_config.as_ref() {
@@ -796,11 +813,11 @@ async fn main() -> anyhow::Result<()> {
     // AutoPermissionHandler which denies writes in Default mode for safety.
     let permission_handler: Arc<dyn claurst_core::PermissionHandler> = if is_headless {
         Arc::new(AutoPermissionHandler {
-            mode: config.permission_mode.clone(),
+            mode: resolver.permission_mode().clone(),
         })
     } else {
         Arc::new(InteractivePermissionHandler {
-            mode: config.permission_mode.clone(),
+            mode: resolver.permission_mode().clone(),
         })
     };
     let cost_tracker = CostTracker::new();
@@ -848,7 +865,7 @@ async fn main() -> anyhow::Result<()> {
             })
             .unwrap_or_default();
         let perm_manager = claurst_core::permissions::PermissionManager::new(
-            config.permission_mode.clone(),
+            resolver.permission_mode().clone(),
             &settings,
         );
         claurst_core::live_session::LiveSession::with_projects(
@@ -861,7 +878,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Initialize MCP servers first (needed for ToolContext.mcp_manager).
-    let mcp_manager_arc = connect_mcp_manager_arc(&config).await;
+    // Merge global + project MCP servers via resolver.
+    let mut mcp_config_for_connect = config.clone();
+    mcp_config_for_connect.mcp_servers = resolver.mcp_servers();
+    let mcp_manager_arc = connect_mcp_manager_arc(&mcp_config_for_connect).await;
 
     let tool_ctx = ToolContext {
         working_dir: cwd.clone(),
@@ -874,6 +894,7 @@ async fn main() -> anyhow::Result<()> {
         non_interactive: cli.print || cli.prompt.is_some(),
         mcp_manager: mcp_manager_arc.clone(),
         config: config.clone(),
+        resolver: resolver.clone(),
         managed_agent_config: config.managed_agents.clone(),
         completion_notifier: None,
         // Populated below once tracker + event log are constructed.
@@ -1201,16 +1222,21 @@ async fn refresh_provider_runtime_state(
         .await
         .context("Failed to load settings for /refresh")?;
     settings.provider = None;
-    settings.config.provider = None;
-    settings.config.model = None;
-    settings.config.api_key = None;
+    settings.model = None;
+    let active_provider = settings.selected_provider_id().to_string();
+    if let Some(cfg) = settings.provider_configs.get_mut(&active_provider) {
+        cfg.api_key = None;
+    }
     settings
         .save()
         .await
         .context("Failed to save refreshed settings")?;
 
     let mut config = current_config.clone();
-    config.api_key = None;
+    let active_provider = config.selected_provider_id().to_string();
+    if let Some(cfg) = config.provider_configs.get_mut(&active_provider) {
+        cfg.api_key = None;
+    }
     config.provider = None;
     config.model = None;
 
@@ -1622,7 +1648,11 @@ async fn run_interactive(
 
     // Set up terminal
     let mut terminal = setup_terminal()?;
-    let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    let mut app = App::new(
+        live_config.clone(),
+        live_session.resolver(),
+        cost_tracker.clone(),
+    );
     // Sync initial effort level (from --effort flag or /effort command) to TUI indicator.
     if let Some(level) = base_query_config.effort_level {
         use claurst_tui::EffortLevel as TuiEL;
@@ -1804,6 +1834,7 @@ async fn run_interactive(
     let mut messages = initial_messages;
     let mut cmd_ctx = CommandContext {
         config: live_config,
+        resolver: live_session.resolver(),
         cost_tracker: cost_tracker.clone(),
         messages: messages.clone(),
         working_dir: tool_ctx.working_dir.clone(),
@@ -1932,7 +1963,9 @@ async fn run_interactive(
         // Draw the UI
         terminal.draw(|f| render_app(f, &app))?;
 
-        // Poll for crossterm events (keyboard/mouse) with short timeout
+        // Poll for crossterm events (keyboard/mouse) with short timeout.
+        // Using 1ms instead of 16ms avoids an artificial ~60 FPS cap that
+        // made the UI feel sluggish (especially input latency and animations).
         if crossterm::event::poll(Duration::from_millis(16))? {
             let evt = event::read()?;
             match evt {
@@ -3559,7 +3592,7 @@ fn format_provider_name(provider_id: &str) -> String {
 /// Print current auth status, then exit with code 0 (logged in) or 1 (not logged in).
 async fn auth_status(json_output: bool) {
     let settings = Settings::load().await.unwrap_or_default();
-    let config = &settings.config;
+    let config = &settings;
     let active_provider = config.selected_provider_id();
     let provider_cfg = config
         .provider_configs
@@ -3597,17 +3630,10 @@ async fn auth_status(json_output: bool) {
         });
 
     let api_provider = format_provider_name(active_provider);
-    let api_key_source = config
-        .api_key
-        .as_ref()
-        .filter(|key| !key.is_empty())
-        .map(|_| "settings.api_key".to_string())
-        .or_else(|| {
-            provider_cfg
-                .and_then(|provider| provider.api_key.as_ref())
-                .filter(|key| !key.is_empty())
-                .map(|_| format!("settings.provider_configs.{active_provider}.api_key"))
-        })
+    let api_key_source = provider_cfg
+        .and_then(|provider| provider.api_key.as_ref())
+        .filter(|key: &&String| !key.is_empty())
+        .map(|_| format!("settings.provider_configs.{active_provider}.api_key"))
         .or(stored_api_key_source)
         .or(env_api_key_source)
         .or_else(|| {
@@ -3653,7 +3679,7 @@ async fn auth_status(json_output: bool) {
         },
     );
 
-    let (auth_method, logged_in) = if let Some(ref tokens) = oauth_tokens {
+    let (auth_method, logged_in): (String, bool) = if let Some(ref tokens) = oauth_tokens {
         let method = if tokens.uses_bearer_auth() {
             "claude.ai"
         } else {
@@ -3674,13 +3700,13 @@ async fn auth_status(json_output: bool) {
             "billing": billing_mode,
         });
 
-        if let Some(ref source) = api_key_source {
+        if let Some(source) = api_key_source.as_ref() {
             obj["apiKeySource"] = serde_json::Value::String(source.clone());
         }
-        if let Some(ref source) = token_source {
+        if let Some(source) = token_source.as_ref() {
             obj["tokenSource"] = serde_json::Value::String(source.clone());
         }
-        if let Some(ref method) = login_method {
+        if let Some(method) = login_method.as_ref() {
             obj["loginMethod"] = serde_json::Value::String(method.clone());
         }
 
@@ -3756,8 +3782,16 @@ async fn auth_logout() {
     // Also clear any API key stored in settings.json
     match Settings::load().await {
         Ok(mut settings) => {
-            if settings.config.api_key.is_some() {
-                settings.config.api_key = None;
+            let active_provider = settings.selected_provider_id().to_string();
+            let had_key = settings
+                .provider_configs
+                .get(&active_provider)
+                .and_then(|p| p.api_key.as_ref())
+                .is_some();
+            if had_key {
+                if let Some(cfg) = settings.provider_configs.get_mut(&active_provider) {
+                    cfg.api_key = None;
+                }
                 if let Err(e) = settings.save().await {
                     eprintln!("Warning: failed to update settings.json: {}", e);
                     had_error = true;

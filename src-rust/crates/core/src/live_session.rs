@@ -15,7 +15,7 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AgentConfig, McpServerConfig, Settings};
+use crate::config::{AgentConfig, ConfigResolver, GlobalScope, McpServerConfig, OnceScope, ProjectScope, SessionScope, Settings};
 use crate::cost::CostTracker;
 use crate::permissions::PermissionManager;
 use crate::project_registry::{ProjectConfig, ProjectRegistry};
@@ -141,6 +141,48 @@ impl LiveSession {
                 mcp_reconnect_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         })
+    }
+
+    /// Build a [`ConfigResolver`] from the current live session state.
+    ///
+    /// Cascades: once (ephemeral overrides) → session → project → global.
+    /// The resolver is a snapshot; it does not track live changes after creation.
+    pub fn resolver(&self) -> ConfigResolver {
+        let settings = self.settings.read();
+        let global = GlobalScope { config: settings.clone() };
+
+        let project = self.runtime.active_project.read().as_ref().and_then(|name| {
+            self.runtime.project_registry.read().get(name).map(|cfg| {
+                ProjectScope {
+                    config: crate::config::ProjectSettings {
+                        allowed_tools: Vec::new(),
+                        mcp_servers: cfg.mcp_servers.values().cloned().collect(),
+                        custom_system_prompt: None,
+                        append_system_prompt: None,
+                        provider: None,
+                        model: None,
+                        agent: cfg.default_agent.clone(),
+                        env: std::collections::HashMap::new(),
+                        permission_rules: cfg.permission_rules.clone(),
+                        default_agent: cfg.default_agent.clone(),
+                    },
+                }
+            })
+        });
+
+        let session: Option<SessionScope> = None; // TODO: wire when session persistence lands
+
+        let once = {
+            let ephem = self.ephemeral.read();
+            OnceScope { config: ephem.overrides.clone() }
+        };
+
+        ConfigResolver {
+            global,
+            project,
+            session,
+            once,
+        }
     }
 
     /// Look up a project config by name. Returns a clone to avoid holding the

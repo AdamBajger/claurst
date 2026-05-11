@@ -84,7 +84,7 @@ impl PrivacyScreen {
         let _ = Settings::load_sync().map(|mut s| {
             // Persist verbose to match telemetry toggle
             if let Some(telemetry_toggle) = self.toggles.iter().find(|t| t.key == "telemetry") {
-                s.config.verbose = telemetry_toggle.enabled;
+                s.verbose = telemetry_toggle.enabled;
             }
             let _ = s.save_sync();
         });

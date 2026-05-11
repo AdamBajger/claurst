@@ -242,7 +242,11 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_app() -> App {
-        App::new(Config::default(), CostTracker::new())
+        let config = Config::default();
+        let resolver = claurst_core::config::ConfigResolver::from_global(
+            claurst_core::config::GlobalScope { config: config.clone() },
+        );
+        App::new(config, resolver, CostTracker::new())
     }
 
     // ---- input helpers ---------------------------------------------------

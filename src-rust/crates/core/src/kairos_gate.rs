@@ -1,8 +1,6 @@
-use crate::feature_flags::FeatureFlagManager;
 use crate::feature_gates::is_env_truthy;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use tracing::warn;
 
 #[derive(Debug, Clone)]
 pub struct KairosRuntimeState {
@@ -77,20 +75,7 @@ fn env_enabled(name: &str) -> bool {
     is_env_truthy(std::env::var(name).ok().as_deref())
 }
 
-async fn check_entitlement() -> (bool, bool) {
-    let manager = FeatureFlagManager::new();
-    if let Err(e) = manager.fetch_flags_async().await {
-        warn!(error = %e, "Kairos entitlement fetch failed; marking entitlement unavailable");
-        return (false, false);
-    }
-
-    let entitled = manager.flag("kairos")
-        || manager.flag("kairos_brief")
-        || manager.flag("tengu_kairos_cron");
-    (true, entitled)
-}
-
-pub async fn resolve_runtime_state(has_completed_onboarding: bool) -> KairosRuntimeState {
+pub fn resolve_runtime_state(has_completed_onboarding: bool) -> KairosRuntimeState {
     let brief_feature_enabled = cfg!(feature = "kairos_brief");
     let channels_feature_enabled = cfg!(feature = "kairos_channels");
 
@@ -104,7 +89,8 @@ pub async fn resolve_runtime_state(has_completed_onboarding: bool) -> KairosRunt
 
     let forced = env_enabled("KAIROS_FORCE");
     let require_entitlement = env_enabled("KAIROS_REQUIRE_ENTITLEMENT");
-    let (entitlement_checked, entitled) = check_entitlement().await;
+    // Entitlement is now a local env-var check only — no remote GrowthBook.
+    let entitled = env_enabled("KAIROS_ENTITLED");
     let entitlement_ok = forced || entitled || !require_entitlement;
 
     let brief_enabled = brief_feature_enabled && env_brief && trusted && entitlement_ok;
@@ -115,7 +101,7 @@ pub async fn resolve_runtime_state(has_completed_onboarding: bool) -> KairosRunt
         brief_enabled,
         channels_enabled,
         proactive_enabled,
-        entitlement_checked,
+        entitlement_checked: true,
         entitled,
         diagnostics: KairosGateDiagnostics {
             brief_feature_compiled: brief_feature_enabled,
@@ -137,8 +123,8 @@ pub fn set_runtime_state(state: KairosRuntimeState) {
     *RUNTIME_STATE.write() = Some(state);
 }
 
-pub async fn initialize_runtime_state(has_completed_onboarding: bool) -> KairosRuntimeState {
-    let state = resolve_runtime_state(has_completed_onboarding).await;
+pub fn initialize_runtime_state(has_completed_onboarding: bool) -> KairosRuntimeState {
+    let state = resolve_runtime_state(has_completed_onboarding);
     set_runtime_state(state.clone());
     state
 }
@@ -166,7 +152,7 @@ pub fn is_kairos_proactive_active() -> bool {
 }
 
 /// Tick interval for proactive mode, in seconds.
-/// Read from KAIROS_PROACTIVE_INTERVAL_SECS; defaults to 900 (15 min); clamped to [60, 3600].
+/// Read from `KAIROS_PROACTIVE_INTERVAL_SECS`; defaults to 900 (15 min); clamped to [60, 3600].
 pub fn proactive_interval_secs() -> u64 {
     std::env::var("KAIROS_PROACTIVE_INTERVAL_SECS")
         .ok()
@@ -177,8 +163,7 @@ pub fn proactive_interval_secs() -> u64 {
 
 /// Per-tick spend ceiling for proactive mode, in USD.
 /// Read from `KAIROS_TICK_MAX_USD`; returns `None` if unset/invalid/non-positive,
-/// meaning no ceiling. A single tick whose delta exceeds this value counts as an
-/// overrun and contributes to the shutdown strike counter in `proactive_ticker`.
+/// meaning no ceiling.
 pub fn proactive_tick_max_usd() -> Option<f64> {
     std::env::var("KAIROS_TICK_MAX_USD")
         .ok()
@@ -187,7 +172,6 @@ pub fn proactive_tick_max_usd() -> Option<f64> {
 }
 
 /// Prompt sent to the model on each proactive tick.
-/// This is the user-turn message; the system prompt already carries the Kairos addendum.
 pub fn proactive_tick_prompt() -> String {
     "Kairos proactive tick. Review the current working directory and session context, then take \
      the most useful autonomous action available: run pending tasks, check for relevant changes \
@@ -198,9 +182,6 @@ pub fn proactive_tick_prompt() -> String {
 }
 
 /// Assistant-mode addendum appended to the system prompt when Kairos is active.
-///
-/// This keeps behavior guidance centralized so CLI/bootstrap paths can apply it
-/// consistently in both interactive and headless sessions.
 pub fn assistant_system_prompt_addendum(proactive_enabled: bool) -> String {
     let mut lines = vec![
         "KAIROS assistant mode is active.",

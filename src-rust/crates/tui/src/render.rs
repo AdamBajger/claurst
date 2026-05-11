@@ -1080,6 +1080,8 @@ fn append_turn_items(
                 show_thinking: false,
                 tool_names: tool_names.clone(),
                 expanded_thinking: expanded_thinking.clone(),
+                tool_visibility: claurst_core::config::ToolVisibility::default(),
+                expanded_tool_results: std::collections::HashSet::new(),
             },
         );
         if !lines.is_empty() {
@@ -1233,6 +1235,8 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
                     show_thinking: false,
                     tool_names: tool_names.clone(),
                     expanded_thinking: app.thinking_expanded.clone(),
+                    tool_visibility: app.config.tool_visibility.clone(),
+                    expanded_tool_results: app.expanded_tool_results.clone(),
                 },
             );
             push_rendered_items(&mut items, lines, Some(index), true);

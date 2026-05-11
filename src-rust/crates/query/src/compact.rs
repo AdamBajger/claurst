@@ -868,8 +868,7 @@ fn strip_images(messages: Vec<claurst_core::types::Message>) -> Vec<claurst_core
 /// Run reactive compact: summarise the oldest messages and return a trimmed
 /// conversation.
 ///
-/// Feature gate: only call this when
-/// `claurst_core::feature_gates::is_feature_enabled("reactive_compact")` is true.
+/// Only used when `CLAURST_FEATURE_REACTIVE_COMPACT` env var is truthy.
 ///
 /// The `cancel` token is checked before the API call so the user can abort
 /// a long-running compact.

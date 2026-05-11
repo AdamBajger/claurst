@@ -266,6 +266,9 @@ mod tests {
             non_interactive: true,
             mcp_manager: None,
             config: Config::default(),
+            resolver: claurst_core::config::ConfigResolver::from_global(
+                claurst_core::config::GlobalScope { config: Config::default() },
+            ),
             managed_agent_config: None,
             completion_notifier: None,
             task_tracker: None,

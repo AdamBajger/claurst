@@ -1582,14 +1582,14 @@ pub async fn run_query_loop(
         // Auto-compact: if context is near-full, summarise older messages now
         // (before the next turn's API call would fail with prompt-too-long).
         //
-        // Reactive compact (T1-1): when the CLAUDE_REACTIVE_COMPACT feature gate
-        // is enabled, we replace the proactive auto-compact path with reactive
+        // Reactive compact (T1-1): when the CLAURST_FEATURE_REACTIVE_COMPACT env
+        // var is set, we replace the proactive auto-compact path with reactive
         // compact / context-collapse instead. This fires on every streaming turn
         // so it can act before a prompt-too-long error is returned by the API.
-        //
-        // Feature gate check: CLAURST_FEATURE_REACTIVE_COMPACT=1
         let reactive_compact_enabled =
-            claurst_core::feature_gates::is_feature_enabled("reactive_compact");
+            claurst_core::feature_gates::is_env_truthy(
+                std::env::var("CLAURST_FEATURE_REACTIVE_COMPACT").ok().as_deref()
+            );
 
         if reactive_compact_enabled {
             // Reactive path: emergency collapse takes priority over normal compact.
@@ -1888,6 +1888,8 @@ pub async fn run_query_loop(
                         let name = name.clone();
                         let input = input.clone();
 
+                        debug!(tool = %name, input = %input, "Tool dispatch start");
+
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(QueryEvent::ToolStart {
                                 tool_name: name.clone(),
@@ -1992,6 +1994,13 @@ pub async fn run_query_loop(
                         &p.input,
                         &result.content,
                         result.is_error,
+                    );
+
+                    debug!(
+                        tool = %p.name,
+                        result = %result.content,
+                        is_error = result.is_error,
+                        "Tool execution complete"
                     );
 
                     if let Some(ref tx) = event_tx {

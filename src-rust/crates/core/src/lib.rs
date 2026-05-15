@@ -12,7 +12,7 @@ pub mod session_storage;
 
 // SQLite-backed session storage (faster alternative to JSONL).
 pub mod sqlite_storage;
-pub use sqlite_storage::{SqliteSessionStore, SessionSummary};
+pub use sqlite_storage::{SqliteSessionStore, SqliteSessionSummary};
 
 // Attachment pipeline — assembles per-turn context attachments (T1-6).
 pub mod attachments;
@@ -1747,6 +1747,7 @@ pub mod constants {
     pub const SESSION_ID_PREFIX_TEAMMATE: &str = "t";
 
     // Retry budget
+    pub const DEFAULT_MAX_RETRIES: u32 = 5;
     pub const MAX_OUTPUT_TOKENS_RETRIES: u32 = 3;
     pub const MAX_COMPACT_RETRIES: u32 = 3;
 

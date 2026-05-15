@@ -93,10 +93,23 @@ pub fn format_token_count(count: u64) -> String {
 pub fn context_window_for_model(model: &str) -> Option<u64> {
     let model_lower = model.to_lowercase();
     // claude-4 family
+    if model_lower.contains("claude-opus-4-6")
+        || model_lower.contains("claude-sonnet-4-6")
+        || model_lower.contains("claude-opus-4-5")
+        || model_lower.contains("claude-sonnet-4-5")
+        || model_lower.contains("claude-haiku-4-5")
+    {
+        return Some(200_000);
+    }
+    // claude-4 broad
     if model_lower.contains("claude-opus-4")
         || model_lower.contains("claude-sonnet-4")
         || model_lower.contains("claude-haiku-4")
     {
+        return Some(200_000);
+    }
+    // claude-3-7 family
+    if model_lower.contains("claude-3-7") {
         return Some(200_000);
     }
     // claude-3-5 family
@@ -108,6 +121,16 @@ pub fn context_window_for_model(model: &str) -> Option<u64> {
         || model_lower.contains("claude-3-sonnet")
         || model_lower.contains("claude-3-haiku")
     {
+        return Some(200_000);
+    }
+    // broad claude fallbacks
+    if model_lower.contains("opus") {
+        return Some(200_000);
+    }
+    if model_lower.contains("haiku") {
+        return Some(200_000);
+    }
+    if model_lower.starts_with("claude") {
         return Some(200_000);
     }
     None

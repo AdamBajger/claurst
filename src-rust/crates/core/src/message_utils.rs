@@ -1,6 +1,7 @@
 //! Message manipulation utilities.
 //! Mirrors key functions from src/utils/messages.ts (5,512 lines).
 
+use crate::token_budget::context_window_for_model;
 use crate::types::{ContentBlock, Message, MessageContent, Role};
 use serde_json::Value;
 
@@ -29,21 +30,9 @@ pub struct ContextUsage {
 /// Calculate context window usage.
 pub fn calculate_context_window_usage(messages: &[Message], model: &str) -> ContextUsage {
     let used = estimate_messages_tokens(messages);
-    let total = context_window_for_model(model);
+    let total = context_window_for_model(model).unwrap_or(200_000);
     let pct = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
     ContextUsage { used, total, pct }
-}
-
-/// Return the context window token limit for a known model.
-pub fn context_window_for_model(model: &str) -> u64 {
-    if model.contains("claude-3-5-haiku") { return 200_000; }
-    if model.contains("claude-3-5-sonnet") { return 200_000; }
-    if model.contains("claude-3-7-sonnet") { return 200_000; }
-    if model.contains("claude-sonnet-4") { return 200_000; }
-    if model.contains("claude-opus-4") { return 200_000; }
-    if model.contains("opus") { return 200_000; }
-    if model.contains("haiku") { return 200_000; }
-    200_000 // safe default
 }
 
 // ---------------------------------------------------------------------------

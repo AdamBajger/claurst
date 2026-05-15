@@ -20,14 +20,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{debug, warn};
+use crate::constants::DEFAULT_MAX_RETRIES;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const SYNC_TIMEOUT_SECS: u64 = 10;
-#[allow(dead_code)]
-const DEFAULT_MAX_RETRIES: u32 = 3;
 /// 500 KB per-file size limit (matches backend enforcement).
 const MAX_FILE_SIZE_BYTES: u64 = 500 * 1024;
 

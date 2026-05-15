@@ -97,7 +97,7 @@ impl SqliteSessionStore {
     }
 
     /// Return the 100 most recently updated sessions.
-    pub fn list_sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
+    pub fn list_sessions(&self) -> anyhow::Result<Vec<SqliteSessionSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, model, created_at, updated_at, message_count
              FROM sessions
@@ -106,7 +106,7 @@ impl SqliteSessionStore {
         )?;
 
         let rows = stmt.query_map([], |row| {
-            Ok(SessionSummary {
+            Ok(SqliteSessionSummary {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 model: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
@@ -121,7 +121,7 @@ impl SqliteSessionStore {
 
     /// Full-text search across session titles and message content.
     /// Returns up to 50 matching sessions ordered by recency.
-    pub fn search_sessions(&self, query: &str) -> anyhow::Result<Vec<SessionSummary>> {
+    pub fn search_sessions(&self, query: &str) -> anyhow::Result<Vec<SqliteSessionSummary>> {
         let like = format!("%{}%", query);
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT s.id, s.title, s.model,
@@ -135,7 +135,7 @@ impl SqliteSessionStore {
         )?;
 
         let rows = stmt.query_map(rusqlite::params![like], |row| {
-            Ok(SessionSummary {
+            Ok(SqliteSessionSummary {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 model: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
@@ -164,7 +164,7 @@ impl SqliteSessionStore {
 
 /// Summary row returned by `list_sessions` and `search_sessions`.
 #[derive(Debug, Clone)]
-pub struct SessionSummary {
+pub struct SqliteSessionSummary {
     pub id: String,
     pub title: Option<String>,
     pub model: String,

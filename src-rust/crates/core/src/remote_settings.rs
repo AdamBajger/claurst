@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
+use crate::constants::DEFAULT_MAX_RETRIES;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -26,7 +27,6 @@ use tracing::{debug, warn};
 
 const SETTINGS_FILENAME: &str = "remote-settings.json";
 const SETTINGS_TIMEOUT_SECS: u64 = 10;
-const DEFAULT_MAX_RETRIES: u32 = 5;
 /// 1-hour polling interval (matches TypeScript POLLING_INTERVAL_MS)
 pub const DEFAULT_POLLING_INTERVAL: Duration = Duration::from_secs(60 * 60);
 

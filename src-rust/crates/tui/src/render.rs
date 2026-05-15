@@ -1706,7 +1706,7 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
         let dim = Color::Rgb(110, 110, 124);
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(1), Constraint::Length(status_area.width.min(36))])
+            .constraints([Constraint::Min(1), Constraint::Length(status_area.width.min(50))])
             .split(status_area);
 
         let left_line = if app.has_credentials {
@@ -2241,17 +2241,6 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 .filter(|c| c.is_ascii_graphic() || *c == ' ')
                 .collect();
             parts.push(Span::styled(clean, Style::default().fg(Color::DarkGray)));
-        }
-
-        // 8b. Update available indicator — shown when a newer version was found.
-        if let Some(ref version) = app.update_available {
-            if !parts.is_empty() {
-                parts.push(Span::raw("  "));
-            }
-            parts.push(Span::styled(
-                format!("⬆ v{} available — /update", version),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ));
         }
 
         // 8. Bridge badge

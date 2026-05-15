@@ -1484,6 +1484,9 @@ mod tests {
         assert!(json.contains("\"jsonrpc\":\"2.0\""));
         assert!(json.contains("\"method\":\"notifications/initialized\""));
         assert!(!json.contains("\"id\""));
+        assert!(req.id.is_none(), "notification should have no id field");
+        assert_eq!(req.jsonrpc, "2.0");
+        assert_eq!(req.method, "notifications/initialized");
     }
 
     // ---- McpTool → ToolDefinition ------------------------------------------

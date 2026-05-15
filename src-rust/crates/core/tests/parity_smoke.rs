@@ -86,8 +86,7 @@ fn load_memory_from_nonexistent_dir() {
     // Loading from a dir with no AGENTS.md should return empty, not panic.
     let tmp = TempDir::new().unwrap();
     let files = load_all_memory_files(tmp.path());
-    // May be empty or may pick up user ~/.claurst/AGENTS.md — both are valid.
-    let _ = files;
+    assert!(files.is_empty(), "expected empty files from nonexistent dir");
 }
 
 // ---------------------------------------------------------------------------

@@ -64,7 +64,8 @@ fn tool_use_shows_summary() {
     // New TS-style format: shows the file path value as summary, not the key name.
     let lines = render_tool_use("FileRead", r#"{"path":"/foo/bar.rs","limit":100}"#);
     let combined = flatten(&lines);
-    assert!(combined.contains("/foo/bar.rs") || combined.contains("FileRead"));
+    assert!(combined.contains("/foo/bar.rs"), "should show the file path value as summary");
+    assert!(combined.contains("FileRead"), "should show the tool name");
 }
 
 // ---------------------------------------------------------------------------

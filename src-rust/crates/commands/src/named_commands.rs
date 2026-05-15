@@ -1224,18 +1224,12 @@ mod tests {
 
     #[test]
     fn test_pr_comments_no_gh_returns_error() {
-        // Without `gh` installed or outside a git repo with an open PR,
-        // the command returns an Error (gh not found or no open PR).
         let ctx = make_ctx();
         let cmd = PrCommentsCommand;
-        // Either gh is missing (Error with "not found") or no PR is open (Error).
-        // Both cases produce CommandResult::Error.
         let result = cmd.execute_named(&[], &ctx);
-        // On CI / dev machines without gh: Error. With gh but no open PR: also Error.
-        // We accept Error or Message (in case gh is installed and finds a PR).
         match result {
-            CommandResult::Error(_) | CommandResult::Message(_) => {}
-            other => panic!("Unexpected result: {:?}", other),
+            CommandResult::Error(_) => {}
+            other => panic!("Expected Error, got: {:?}", other),
         }
     }
 

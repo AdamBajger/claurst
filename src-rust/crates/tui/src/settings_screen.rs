@@ -1300,6 +1300,7 @@ pub fn handle_settings_key(
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::Path;
     use tempfile::NamedTempFile;
 
     // Helper: create a temporary settings.json with a given JSON body.
@@ -1310,27 +1311,26 @@ mod tests {
         f
     }
 
+    fn read_setting_bool_at(config_dir_path: &Path, key: &str, default: bool) -> bool {
+        let path = config_dir_path.join("settings.json");
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(b) = val.get(key).and_then(|v| v.as_bool()) {
+                    return b;
+                }
+            }
+        }
+        default
+    }
+
     // ---------------------------------------------------------------------------
     // read_setting_bool tests
     // ---------------------------------------------------------------------------
 
     #[test]
     fn read_setting_bool_returns_default_when_file_missing() {
-        // Point config_dir at a non-existent path by using a temp dir that has
-        // no settings.json. Because read_setting_bool internally calls
-        // Settings::config_dir() we can't easily redirect it in a unit test
-        // without modifying the helper signature; instead, we exercise the
-        // fallback branch directly by using a fabricated Settings and relying on
-        // the fact that a random temp dir won't have settings.json.
-        //
-        // This test simply asserts the default is honoured when parsing fails.
-        let settings = Settings::default();
-        // Call with a key that definitely doesn't exist in the (absent) file.
-        let result = read_setting_bool(&settings, "thisKeyDoesNotExist_xyzzy", true);
-        // We can't guarantee the file doesn't exist on the test machine, but we
-        // can guarantee that a missing key returns the default.
-        // If the file exists but lacks the key: returns true.
-        // If the file is absent: returns true.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let result = read_setting_bool_at(tmp.path(), "thisKeyDoesNotExist_xyzzy", true);
         assert!(result, "default should be returned for missing key");
     }
 

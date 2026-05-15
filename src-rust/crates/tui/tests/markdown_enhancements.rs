@@ -175,17 +175,16 @@ fn markdown_with_bold_and_italic() {
     assert!(content.contains("italic"));
 }
 
-// Disabled: This test can cause excessive memory usage with complex markdown
-// #[test]
-// fn markdown_with_code_block_and_table() {
-//     let markdown = "Here's code:\n\n```rust\nfn main() {}\n```\n\n| Name | Value |\n|------|-------|\n| Test | 123   |";
-//     let lines = render_markdown(markdown, 80);
-//     let content = flatten(&lines);
-//
-//     assert!(content.contains("main"));
-//     assert!(content.contains("Name"));
-//     assert!(content.contains("Test"));
-// }
+#[test]
+fn markdown_with_code_block_and_table() {
+    let markdown = "Here's code:\n\n```rust\nfn main() {}\n```\n\n| Name | Value |\n|------|-------|\n| Test | 123   |";
+    let lines = render_markdown(markdown, 80);
+    let content = flatten(&lines);
+
+    assert!(content.contains("main"));
+    assert!(content.contains("Name"));
+    assert!(content.contains("Test"));
+}
 
 #[test]
 fn table_with_empty_cells() {

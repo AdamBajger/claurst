@@ -118,29 +118,37 @@ mod tests {
     #[test]
     fn test_noop_span_methods() {
         let span = NoopSpan::new();
+        span.set_attribute("test_key", "test_value");
         span.set_attribute("key", "value");
         span.set_attributes(&[("k1", "v1"), ("k2", "v2")]);
         span.add_event("test_event");
         span.record_exception("test error");
         span.end();
-        // If this test passes, the no-ops work correctly
+        let span2 = NoopSpan::default();
+        span2.set_attribute("a", "b");
+        span2.end();
     }
 
     #[test]
     fn test_span_functions() {
         let root = start_interaction_span("req-123");
+        root.set_attribute("test", "val");
         end_interaction_span(root);
 
         let llm = start_llm_request_span("claude-3", 4096);
+        llm.set_attribute("model", "claude-3");
         end_llm_request_span(llm, 100, 50);
 
         let tool = start_tool_span("bash");
+        tool.set_attribute("tool", "bash");
         end_tool_span(tool, true, None);
 
         let perm = start_permission_span("read_file");
+        perm.set_attribute("perm", "read_file");
         end_permission_span(perm);
 
         let hook = start_hook_span("pre_request");
+        hook.set_attribute("hook", "pre_request");
         end_hook_span(hook);
 
         assert!(!is_enhanced_telemetry_enabled());

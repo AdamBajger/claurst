@@ -322,10 +322,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_api_key_prefers_openai() {
-        // We can't safely mutate env vars in a parallel test environment without
-        // a lock, so just verify the function runs without panicking when the
-        // env vars are absent.
-        let _ = resolve_api_key();
+    fn resolve_api_key_returns_none_when_no_env_vars_set() {
+        let result = resolve_api_key();
+        assert!(result.is_none(), "resolve_api_key should return None when no env vars are set");
     }
 }

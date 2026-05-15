@@ -187,6 +187,22 @@ mod tests {
     fn test_estimate_tokens() {
         let text = "This is a test message with some content";
         let tokens = estimate_tokens(text);
-        assert!(tokens > 0);
+        assert_eq!(tokens, 10);
+    }
+
+    #[test]
+    fn test_estimate_tokens_empty() {
+        assert_eq!(estimate_tokens(""), 1);
+    }
+
+    #[test]
+    fn test_estimate_message_tokens_sum() {
+        let msgs = vec![
+            Message::user("abcd"),
+            Message::user("efgh"),
+        ];
+        let tokens = estimate_message_tokens(&msgs);
+        assert!(tokens >= 2, "at least 2 tokens per message for role overhead");
+        assert!(tokens > 0, "non-empty messages produce tokens");
     }
 }

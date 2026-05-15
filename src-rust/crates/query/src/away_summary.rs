@@ -137,14 +137,14 @@ mod tests {
         assert_eq!(cfg.max_tokens, 300);
     }
 
-    #[test]
-    fn empty_messages_returns_none_synchronously() {
-        // We can verify the empty-check without an async runtime.
-        // The async path is integration-tested separately.
+    #[tokio::test]
+    async fn empty_messages_returns_none_synchronously() {
+        let client = AnthropicClient::new(Default::default()).unwrap();
+        let config = AwaySummaryConfig::default();
+        let cancel = CancellationToken::new();
         let messages: Vec<Message> = vec![];
-        assert!(messages.is_empty(), "test pre-condition");
-        // (The actual None is returned inside the async fn; the check is the
-        //  first line, so no network call is ever made.)
+        let result = generate_away_summary(&messages, &client, &config, cancel).await;
+        assert!(result.is_none(), "empty messages should return None synchronously");
     }
 
     #[test]

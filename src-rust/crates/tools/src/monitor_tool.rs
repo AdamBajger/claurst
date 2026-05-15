@@ -28,7 +28,6 @@ enum MonitorAction {
     List,
     Status,
     Output,
-    Cancel,
 }
 
 #[async_trait]
@@ -39,7 +38,7 @@ impl Tool for MonitorTool {
 
     fn description(&self) -> &str {
         "Monitor background tasks started with run_in_background=true. \
-        List all tasks, check status, retrieve output, or cancel a running task."
+        List all tasks, check status, or retrieve output."
     }
 
     fn permission_level(&self) -> PermissionLevel {
@@ -52,8 +51,8 @@ impl Tool for MonitorTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "status", "output", "cancel"],
-                    "description": "Action to perform. 'list' shows all tasks, 'status'/'output' inspect a specific task, 'cancel' terminates a running task.",
+                    "enum": ["list", "status", "output"],
+                    "description": "Action to perform. 'list' shows all tasks, 'status'/'output' inspect a specific task.",
                     "default": "list"
                 },
                 "task_id": {
@@ -132,44 +131,7 @@ impl Tool for MonitorTool {
                 }
             }
 
-            MonitorAction::Cancel => {
-                let id = match parsed.task_id {
-                    Some(id) => id,
-                    None => return ToolResult::error("task_id required for cancel action"),
-                };
-                match global_registry().get(&id) {
-                    None => ToolResult::error(format!("Task {} not found", id)),
-                    Some(t) => {
-                        if let TaskStatus::Running = t.status {
-                            // Kill by PID if available.
-                            if let Some(pid) = t.pid {
-                                // On Windows use taskkill; on Unix send SIGTERM.
-                                #[cfg(windows)]
-                                {
-                                    let _ = std::process::Command::new("taskkill")
-                                        .args(["/PID", &pid.to_string(), "/F"])
-                                        .output();
-                                }
-                                #[cfg(unix)]
-                                {
-                                    use std::process::Command;
-                                    let _ = Command::new("kill")
-                                        .args(["-TERM", &pid.to_string()])
-                                        .output();
-                                }
-                            }
-                            global_registry().update_status(&id, TaskStatus::Cancelled);
-                            ToolResult::success(format!("Task {} cancelled.", id))
-                        } else {
-                            ToolResult::error(format!(
-                                "Task {} is not running (status: {})",
-                                id, t.status
-                            ))
-                        }
-                    }
-                }
             }
-        }
     }
 }
 
@@ -227,16 +189,6 @@ mod tests {
     async fn monitor_output_unknown_task() {
         let tool = MonitorTool;
         let input = json!({"action": "output", "task_id": "nonexistent-uuid-1234"});
-        let ctx = make_test_ctx();
-        let result = tool.execute(input, &ctx).await;
-        assert!(result.is_error);
-        assert!(result.content.contains("not found"));
-    }
-
-    #[tokio::test]
-    async fn monitor_cancel_unknown_task() {
-        let tool = MonitorTool;
-        let input = json!({"action": "cancel", "task_id": "nonexistent-uuid-5678"});
         let ctx = make_test_ctx();
         let result = tool.execute(input, &ctx).await;
         assert!(result.is_error);

@@ -24,6 +24,10 @@ struct GrepInput {
     output_mode: String,
     #[serde(default)]
     context: Option<usize>,
+    #[serde(default, rename = "-A")]
+    after_context: Option<usize>,
+    #[serde(default, rename = "-B")]
+    before_context: Option<usize>,
     #[serde(default, rename = "-i")]
     case_insensitive: bool,
     #[serde(default, rename = "-n")]
@@ -32,6 +36,8 @@ struct GrepInput {
     head_limit: Option<usize>,
     #[serde(default)]
     multiline: bool,
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 fn default_output_mode() -> String {
@@ -109,7 +115,15 @@ impl Tool for GrepTool {
                 },
                 "context": {
                     "type": "number",
-                    "description": "Number of context lines before and after each match"
+                    "description": "Number of context lines before and after each match (-C)"
+                },
+                "-A": {
+                    "type": "number",
+                    "description": "Number of lines to show after each match"
+                },
+                "-B": {
+                    "type": "number",
+                    "description": "Number of lines to show before each match"
                 },
                 "-i": {
                     "type": "boolean",
@@ -126,6 +140,10 @@ impl Tool for GrepTool {
                 "multiline": {
                     "type": "boolean",
                     "description": "Enable multiline mode where . matches newlines"
+                },
+                "offset": {
+                    "type": "number",
+                    "description": "Skip the first N entries (requires output_mode=content)"
                 }
             },
             "required": ["pattern"]
@@ -166,8 +184,18 @@ impl Tool for GrepTool {
             Err(e) => return ToolResult::error(format!("Invalid regex: {}", e)),
         };
 
+        if params.context.is_some() && (params.after_context.is_some() || params.before_context.is_some()) {
+            return ToolResult::error("context (-C) is mutually exclusive with -A and -B".to_string());
+        }
+        if params.offset.is_some() && params.offset != Some(0) && params.output_mode != "content" {
+            return ToolResult::error("offset requires output_mode=content".to_string());
+        }
+
         let head_limit = params.head_limit.unwrap_or(250);
         let context_lines = params.context.unwrap_or(0);
+        let before_ctx = params.before_context.unwrap_or(context_lines);
+        let after_ctx = params.after_context.unwrap_or(context_lines);
+        let offset = params.offset.unwrap_or(0);
         let show_line_numbers = params.show_line_numbers.unwrap_or(true);
 
         // Collect candidate file extensions
@@ -186,7 +214,8 @@ impl Tool for GrepTool {
                 &search_path,
                 &regex,
                 &params.output_mode,
-                context_lines,
+                before_ctx,
+                after_ctx,
                 show_line_numbers,
             );
         }
@@ -272,17 +301,27 @@ impl Tool for GrepTool {
 
             match params.output_mode.as_str() {
                 "files_with_matches" => {
-                    results.push(path.display().to_string());
+                    if match_count >= offset {
+                        results.push(path.display().to_string());
+                    }
                     match_count += 1;
                 }
                 "count" => {
-                    results.push(format!("{}:{}", path.display(), file_matches.len()));
+                    if match_count >= offset {
+                        results.push(format!("{}:{}", path.display(), file_matches.len()));
+                    }
                     match_count += 1;
                 }
                 "content" => {
+                    let mut entries_collected = 0usize;
+                    let mut entries_seen = 0usize;
                     for (line_idx, _) in &file_matches {
-                        let start = line_idx.saturating_sub(context_lines);
-                        let end = (*line_idx + context_lines + 1).min(lines.len());
+                        if entries_seen < offset {
+                            entries_seen += 1;
+                            continue;
+                        }
+                        let start = line_idx.saturating_sub(before_ctx);
+                        let end = (*line_idx + after_ctx + 1).min(lines.len());
 
                         for ci in start..end {
                             let prefix = if show_line_numbers {
@@ -293,20 +332,29 @@ impl Tool for GrepTool {
                             results.push(format!("{}{}", prefix, lines[ci]));
                         }
 
-                        if context_lines > 0 {
+                        if before_ctx > 0 || after_ctx > 0 {
                             results.push("--".to_string());
                         }
 
+                        entries_collected += 1;
                         match_count += 1;
+                        if entries_collected >= head_limit {
+                            break;
+                        }
+                    }
+                    if entries_collected == 0 {
+                        continue;
                     }
                 }
                 _ => {
-                    results.push(path.display().to_string());
+                    if match_count >= offset {
+                        results.push(path.display().to_string());
+                    }
                     match_count += 1;
                 }
             }
 
-            if match_count >= head_limit {
+            if match_count >= head_limit + offset {
                 break;
             }
         }
@@ -330,7 +378,8 @@ impl GrepTool {
         path: &PathBuf,
         regex: &regex::Regex,
         output_mode: &str,
-        context_lines: usize,
+        before_ctx: usize,
+        after_ctx: usize,
         show_line_numbers: bool,
     ) -> ToolResult {
         let content = match std::fs::read_to_string(path) {
@@ -364,8 +413,8 @@ impl GrepTool {
             _ => {
                 let mut results = Vec::new();
                 for line_idx in &matching_lines {
-                    let start = line_idx.saturating_sub(context_lines);
-                    let end = (*line_idx + context_lines + 1).min(lines.len());
+                    let start = line_idx.saturating_sub(before_ctx);
+                    let end = (*line_idx + after_ctx + 1).min(lines.len());
                     for ci in start..end {
                         if show_line_numbers {
                             results.push(format!("{}:{}", ci + 1, lines[ci]));
@@ -373,7 +422,7 @@ impl GrepTool {
                             results.push(lines[ci].to_string());
                         }
                     }
-                    if context_lines > 0 {
+                    if before_ctx > 0 || after_ctx > 0 {
                         results.push("--".to_string());
                     }
                 }

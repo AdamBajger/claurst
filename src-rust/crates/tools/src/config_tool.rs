@@ -34,7 +34,7 @@ impl Tool for ConfigTool {
          Changes persist to ~/.claurst/settings.json."
     }
 
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::Write }
+    fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -52,11 +52,17 @@ impl Tool for ConfigTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: ConfigInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+
+        if params.value.is_some() {
+            if let Err(e) = ctx.check_permission("config_write", "Modify configuration setting", false) {
+                return ToolResult::error(e.to_string());
+            }
+        }
 
         let key = params.setting.trim();
 

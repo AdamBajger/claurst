@@ -68,6 +68,17 @@ static TOOL_CATALOG: &[ToolEntry] = &[
     ToolEntry { name: "Config", description: "Get or set Claurst configuration", keywords: &["config", "settings", "model", "verbose", "permission", "configure"] },
     ToolEntry { name: "SendMessage", description: "Send a message to another agent", keywords: &["send", "message", "agent", "broadcast", "communicate", "inbox"] },
     ToolEntry { name: "Skill", description: "Execute a skill prompt template", keywords: &["skill", "command", "template", "prompt", "slash", "custom"] },
+    ToolEntry { name: "monitor", description: "Monitor background tasks", keywords: &["monitor", "background", "task", "status", "output"] },
+    ToolEntry { name: "BatchEdit", description: "Apply multiple file edits atomically", keywords: &["edit", "batch", "atomic", "replace", "rollback"] },
+    ToolEntry { name: "ApplyPatch", description: "Apply a unified diff patch to files", keywords: &["patch", "diff", "apply", "unified"] },
+    ToolEntry { name: "LSP", description: "Query a language server for code intelligence", keywords: &["lsp", "language", "server", "hover", "definition", "references", "diagnostics"] },
+    ToolEntry { name: "REPL", description: "Execute code in a persistent interpreter session", keywords: &["repl", "interpreter", "python", "node", "javascript", "bash"] },
+    ToolEntry { name: "TeamCreate", description: "Create a named team of agents for shared tasks", keywords: &["team", "agent", "create", "parallel", "collaborate"] },
+    ToolEntry { name: "TeamDelete", description: "Cancel a running team and clean up directories", keywords: &["team", "delete", "cancel", "cleanup", "stop"] },
+    ToolEntry { name: "StructuredOutput", description: "Return structured JSON output", keywords: &["structured", "output", "json", "format"] },
+    ToolEntry { name: "mcp__auth", description: "Start OAuth 2.0 flow for an MCP server", keywords: &["mcp", "oauth", "auth", "token", "authenticate"] },
+    ToolEntry { name: "RemoteTrigger", description: "Send a named event to another Claurst session", keywords: &["remote", "trigger", "event", "coordinate", "notify"] },
+    ToolEntry { name: "GoalComplete", description: "Mark the active goal as complete", keywords: &["goal", "complete", "finish", "deliverable", "audit"] },
 ];
 
 #[async_trait]

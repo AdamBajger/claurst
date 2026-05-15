@@ -7,8 +7,11 @@ src-rust/target/
 # Refs
 refs/
 
-# Claude
+# Agents and LLM tools
 .claude
+.roo
+.claurst
+.kilo
 
 # Git
 .gitignore
@@ -16,5 +19,4 @@ refs/
 
 # VSCode / unsolicited devcontainers mounts
 .vscode/
-.claurst/
 

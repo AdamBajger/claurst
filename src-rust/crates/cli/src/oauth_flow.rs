@@ -1,7 +1,8 @@
-// WARNING: The OAuth client IDs in this module are registered to Anthropic's Claude Code CLI.
-// They will not work for Claurst. This module is preserved for reference but disabled.
-// Users should authenticate via API key (/connect → Anthropic → paste key).
-//
+/* DISABLED: Full OAuth PKCE flow for Anthropic API key creation.
+   This flow requires registered OAuth client IDs with Anthropic, which are
+   not available for the Claurst OSS build. Code preserved for reference.
+   Use claurst-codex for Codex OAuth (codex_oauth_flow.rs) instead. */
+
 // OAuth 2.0 PKCE login flow for the Claurst CLI.
 //
 // Implements the same flow as the TypeScript OAuthService + authLogin():

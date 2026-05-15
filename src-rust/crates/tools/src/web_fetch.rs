@@ -14,6 +14,9 @@ pub struct WebFetchTool;
 #[derive(Debug, Deserialize)]
 struct WebFetchInput {
     url: String,
+    /* NOTE: prompt field is deserialized but currently unused during execution.
+           Spec (03_tools.md §9.1) says WebFetch should summarize content via Haiku model 
+           using this prompt. Not yet implemented — raw content returned instead. */
     #[serde(default)]
     #[allow(dead_code)]
     prompt: Option<String>,

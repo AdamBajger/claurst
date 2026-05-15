@@ -1,3 +1,7 @@
+/* OBSOLETE: BashTool replaced by PtyBashTool in all_tools(). PtyBashTool uses PTY-based
+   execution which is richer. This pipe-based BashTool is kept for reference but is NOT
+   registered in the tool registry. See pty_bash.rs for the active implementation. */
+
 // Bash tool: execute shell commands with timeout, streaming output, and
 // persistent shell state (cwd + env) across invocations.
 

@@ -1,3 +1,9 @@
+/* STUB (Phase 2A): SseStreamParser and JsonLinesStreamParser are stubs.
+   Actual SSE/JSON-lines parsing is handled inline in provider-specific 
+   streaming implementations (AnthropicProvider, OpenAiProvider, etc.).
+   These parser types return Err("not yet implemented") and are not used
+   by any provider. */
+
 // stream_parser.rs — Trait and marker structs for parsing provider HTTP
 // response bodies into unified `StreamEvent` streams.
 //

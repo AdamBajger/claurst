@@ -1,3 +1,7 @@
+/* LEGACY: Anthropic↔OpenAI format translation used by old AnthropicClient::Provider::Codex path.
+   Modern Codex integration lives in providers/codex.rs (CodexProvider implements LlmProvider).
+   This adapter is kept for reference but the active Codex path uses CodexProvider. */
+
 //! Codex schema adapter — translates between Anthropic Messages API and OpenAI API formats.
 //!
 //! When using OpenAI Codex provider, requests are translated from Anthropic's

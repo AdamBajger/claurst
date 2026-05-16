@@ -1,0 +1,127 @@
+# ── Image ─────────────────────────────────────────────────────────────────────
+image:
+  repository: ghcr.io/adambajer/claurst
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Image pull secrets for private registries.
+imagePullSecrets: []
+
+# ── Replica count ─────────────────────────────────────────────────────────────
+# Each replica is an independent SSH host with its own session state.
+replicaCount: 1
+
+# ── SSH access ────────────────────────────────────────────────────────────────
+ssh:
+  # One or more SSH public keys (newline-separated) that are allowed to
+  # connect.  Required — the container will reject all logins without it.
+  #
+  # Example (single key):
+  #   authorizedKeys: "ssh-ed25519 AAAA... user@host"
+  #
+  # Example (multiple keys, use a YAML block scalar):
+  #   authorizedKeys: |
+  #     ssh-ed25519 AAAA... alice@laptop
+  #     ssh-ed25519 AAAA... bob@workstation
+  authorizedKeys: ""
+
+# ── AI provider API keys ──────────────────────────────────────────────────────
+# Set the key for the provider(s) you want to use inside claurst.
+# Leave keys empty ("") to omit them from the Secret / container env entirely.
+# You can also configure providers interactively inside claurst with /connect.
+apiKeys:
+  anthropic: ""    # ANTHROPIC_API_KEY
+  openai: ""       # OPENAI_API_KEY
+  googleAi: ""     # GOOGLE_AI_API_KEY  (Gemini)
+  groq: ""         # GROQ_API_KEY
+  deepseek: ""     # DEEPSEEK_API_KEY
+  mistral: ""      # MISTRAL_API_KEY
+  githubToken: ""  # GITHUB_TOKEN       (GitHub Copilot)
+
+# ── Extra environment variables ───────────────────────────────────────────────
+# Arbitrary CLAURST_* or other variables to inject into the container.
+# Values are stored in a ConfigMap (not a Secret).
+#
+# Example:
+#   extraEnv:
+#     CLAURST_LOG_LEVEL: "debug"
+#     CLAURST_THEME: "dark"
+extraEnv: {}
+
+# ── Service ───────────────────────────────────────────────────────────────────
+service:
+  # LoadBalancer exposes SSH on a cloud-assigned external IP.
+  # Use NodePort if your cluster does not support LoadBalancer.
+  type: LoadBalancer
+  # External port clients connect to.  22 is the SSH default.
+  port: 22
+  # Internal container port (must match the Dockerfile EXPOSE / sshd_config).
+  targetPort: 22
+  # Optional: pin the NodePort when type is NodePort (30000-32767).
+  nodePort: ""
+  # Optional: specify a pre-existing static IP (cloud-specific annotation may
+  # also be needed — see service.annotations).
+  loadBalancerIP: ""
+  # Cloud-specific annotations (e.g. to request an internal LB, static IP, etc.)
+  # Example for GKE:
+  #   annotations:
+  #     cloud.google.com/load-balancer-type: "Internal"
+  annotations: {}
+
+# ── Persistence ───────────────────────────────────────────────────────────────
+# Mount a PersistentVolume at /etc/ssh so SSH host keys survive pod restarts.
+# Without this the host key fingerprint changes on every restart, causing SSH
+# to warn about a host key mismatch.
+persistence:
+  enabled: true
+  storageClass: ""   # Leave empty to use the cluster default StorageClass.
+  size: 32Mi
+  accessMode: ReadWriteOnce
+  # Optional: use a pre-existing PVC instead of creating one.
+  existingClaim: ""
+
+# ── Service Account ───────────────────────────────────────────────────────────
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# ── Pod settings ──────────────────────────────────────────────────────────────
+podAnnotations: {}
+podLabels: {}
+
+# Security context for the Pod.
+podSecurityContext: {}
+
+# Security context for the claurst container.
+# Running as root is required by sshd.
+securityContext: {}
+
+# ── Resource requests / limits ────────────────────────────────────────────────
+resources: {}
+# Recommended starting point (adjust to your workload):
+#   requests:
+#     cpu: 100m
+#     memory: 128Mi
+#   limits:
+#     cpu: 500m
+#     memory: 512Mi
+
+# ── Probes ────────────────────────────────────────────────────────────────────
+livenessProbe:
+  tcpSocket:
+    port: ssh
+  initialDelaySeconds: 10
+  periodSeconds: 30
+
+readinessProbe:
+  tcpSocket:
+    port: ssh
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+# ── Node placement ────────────────────────────────────────────────────────────
+nodeSelector: {}
+tolerations: []
+affinity: {}

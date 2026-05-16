@@ -1,0 +1,49 @@
+Thank you for installing {{ .Chart.Name }} {{ .Chart.AppVersion }}!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  claurst is now running as a long-lived SSH host.
+  Connect and the claurst TUI coding agent starts automatically.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Wait for the external IP to be assigned (LoadBalancer):
+
+     kubectl get svc {{ include "claurst.fullname" . }} \
+       --namespace {{ .Release.Namespace }} \
+       --watch
+
+2. Once the EXTERNAL-IP is available, connect:
+
+     ssh -p {{ .Values.service.port }} claurst@<EXTERNAL-IP>
+
+   The claurst TUI starts immediately.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  API key configuration
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  If you did not supply API keys at install time you can configure them
+  interactively from inside claurst with the /connect command, or upgrade
+  the release:
+
+    helm upgrade {{ .Release.Name }} ./helm/claurst \
+      --namespace {{ .Release.Namespace }} \
+      --reuse-values \
+      --set apiKeys.anthropic=sk-ant-...
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SSH host key stability
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{{- if .Values.persistence.enabled }}
+  Host key persistence is ENABLED via a PersistentVolumeClaim.
+  The SSH fingerprint will remain stable across pod restarts.
+{{- else }}
+  Host key persistence is DISABLED.
+  The SSH fingerprint will change on every pod restart, causing SSH to
+  display a host key warning.  Enable it with:
+
+    helm upgrade {{ .Release.Name }} ./helm/claurst \
+      --namespace {{ .Release.Namespace }} \
+      --reuse-values \
+      --set persistence.enabled=true
+{{- end }}

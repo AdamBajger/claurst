@@ -1,0 +1,48 @@
+# SSH daemon configuration for the claurst cloud container.
+
+Port 22
+ListenAddress 0.0.0.0
+
+# Host keys generated at container startup by entrypoint.sh.
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+# ── Authentication ────────────────────────────────────────────────────────────
+# Require public-key auth; disable passwords entirely.
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+
+# ── Session behavior ─────────────────────────────────────────────────────────
+# Launch the claurst runtime for every SSH session regardless of what command
+# the client requested.
+ForceCommand /usr/local/bin/claurst
+
+# Allow the client to allocate a PTY (required for the TUI).
+PermitTTY yes
+
+# ── Security hardening ────────────────────────────────────────────────────────
+AllowTcpForwarding no
+X11Forwarding no
+GatewayPorts no
+PermitTunnel no
+AllowAgentForwarding no
+
+# ── Environment ───────────────────────────────────────────────────────────────
+# Let clients propagate locale and CLAURST_* variables through the session.
+# API keys should be configured inside claurst with /connect rather than
+# forwarded as environment variables to limit exposure in process listings.
+AcceptEnv LANG LC_* CLAURST_*
+
+# ── Keep-alive ────────────────────────────────────────────────────────────────
+ClientAliveInterval 30
+ClientAliveCountMax 6
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+UsePAM no
+PrintMotd no
+SyslogFacility AUTH
+LogLevel INFO
